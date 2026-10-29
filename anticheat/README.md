@@ -20,7 +20,7 @@ Running from a saved file also works:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\AntiCheatCheck.ps1
 ```
 
-Options (file mode only): `-SkipProcessExplorer`, `-SkipHistory`, `-NoElevate`.
+Options (file mode only): `-SkipProcessExplorer`, `-SkipRegistry`, `-NoElevate`.
 
 Output is results only: one line per check, the flagged items under it, then the safety score.
 
@@ -48,18 +48,38 @@ The AMSI check runs Microsoft's harmless "AMSI test sample", so Windows Security
 
 After Step 1 the player presses Enter. The script downloads `procexp64.exe` (or the ARM64/x86 build) from `live.sysinternals.com` into a temporary folder, checks it has a valid Microsoft signature and launches it. Nothing is installed. When Process Explorer is closed, the temporary copy is deleted.
 
-## Step 3 - Execution history and tampering
+## Step 3 - Registry check
 
-After Process Explorer is closed, the player presses Enter. This step looks back 7 days (`HistoryDays` in `$Config`):
+After Process Explorer is closed, the player presses Enter. Step 3 collects every executable path Windows has recorded in these places:
 
-| Check | Result |
+| Source | What it records |
 |---|---|
-| Programs run, from the Background Activity Moderator (`bam`) registry, including other user accounts. Only flagged ones are listed: known cheat/tool/macro names, executables **deleted after running**, and unsigned executables run from Temp/Downloads/Desktop and similar. | yellow per program, green if none |
-| Microsoft Defender detections (threat name, time, file) | yellow per detection |
-| Security log cleared (event 1102), other logs cleared (event 104) | red |
-| Recycle Bin last changed and item count | info |
+| ShimCache (AppCompatCache) | Executables seen by the compatibility engine |
+| Amcache.hve | Programs run or installed, with SHA1 hash. The hive is locked, so it is read from a shadow copy (`esentutl /vss`) loaded as a temporary hive. |
+| BAM | Last run time per executable, per user account |
+| UserAssist | Programs started from Explorer, with last run time |
+| MUICache | Programs that have been run |
+| Compatibility Assistant Store | Programs that have been run |
+| FeatureUsage (AppSwitched / AppLaunch) | Programs used from the taskbar |
+| RunMRU | Commands typed into Win+R |
 
-This step runs after the safety score, so it does not change it.
+Every user account on the PC is included. Entries are merged by path, and each flagged path is printed once with its reasons, last run time (if known) and the sources it was found in:
+
+```
+[WARN] C:\Users\x\Downloads\loader.exe - keyword 'loader', deleted | 2026-10-28 21:14 | BAM, ShimCache, Amcache
+```
+
+Detection rules:
+
+1. **Keywords** `app`, `loader`, `map` in the file name (`RegistryKeywords`). Skipped for `C:\Windows` (except `Windows\Temp`) and Store apps (`RegistryIgnorePattern`).
+2. **Known cheat/tool/macro names** from `FlaggedNames`.
+3. **Known bad SHA1** from Amcache (`KnownBadSha1`, empty by default). This rule shows in **red**.
+4. **Run from a USB drive or network share.**
+5. **Unusual extension:** an executed file that is not `.exe`/`.dll` and similar, such as a renamed binary run as `.tmp` or `.png`.
+6. **Random hex/GUID file name** in Temp, Downloads, Desktop and similar folders.
+7. **Deleted or unsigned** executables from those same folders.
+
+If nothing matches, Step 3 prints one green line with the number of entries checked. Step 3 runs after the safety score, so it does not change it.
 
 ## Live monitor (`LiveMonitor.ps1`)
 

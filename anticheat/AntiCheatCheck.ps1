@@ -14,10 +14,10 @@
         signature is verified, it is launched for staff review and the
         temporary copy is removed once it is closed.
 
-    Step 3 - Execution history and tampering
-        Programs run in the last days (Background Activity Moderator registry),
-        including ones deleted since, Microsoft Defender detections, cleared
-        event logs and the last Recycle Bin change.
+    Step 3 - Registry check
+        Execution traces from ShimCache, Amcache, BAM, UserAssist, MUICache,
+        the Compatibility Assistant store, FeatureUsage and RunMRU, checked
+        for keywords and with custom detection rules.
 
     The live monitor is a separate script: LiveMonitor.ps1.
 
@@ -39,7 +39,7 @@ param(
     # Skip Step 2.
     [switch]$SkipProcessExplorer,
     # Skip Step 3.
-    [switch]$SkipHistory
+    [switch]$SkipRegistry
 )
 
 # =============================================================================
@@ -100,8 +100,18 @@ $Config = @{
     # Executables in these locations are treated as higher risk when unsigned (regex).
     SuspiciousLocationPattern = '\\AppData\\Local\\Temp\\|\\Windows\\Temp\\|\\Downloads\\|\\Desktop\\|\\Users\\Public\\|\\\$Recycle\.Bin\\|\\ProgramData\\[^\\]+\.exe$'
 
-    # How far back Step 3 looks, in days.
-    HistoryDays = 7
+    # Step 3: words looked for in executable file names from registry traces.
+    RegistryKeywords = @('app', 'loader', 'map')
+
+    # Step 3: paths skipped by keyword and location rules (Windows itself, Store apps).
+    RegistryIgnorePattern = '^[A-Za-z]:\\Windows\\(?!Temp\\)|\\Program Files\\WindowsApps\\'
+
+    # Step 3: extensions expected for executed files; anything else is flagged.
+    ExecutableExtensions = @('.exe', '.dll', '.com', '.scr', '.sys', '.msi', '.msp', '.msu', '.cpl', '.ocx',
+                             '.bat', '.cmd', '.ps1', '.vbs', '.js', '.jar', '.lnk', '.appref-ms')
+
+    # Step 3: SHA1 hashes (lower-case) of known cheat files, matched against Amcache. Shown in RED.
+    KnownBadSha1 = @()
 
     # Sysinternals live download location for Step 2.
     SysinternalsLive = 'https://live.sysinternals.com'
@@ -736,12 +746,14 @@ function Invoke-Step2ProcessExplorer {
 }
 
 # =============================================================================
-#  Step 3 - Execution history and tampering
+#  Step 3 - Registry check
 # =============================================================================
-$script:DosDeviceSource = @'
+$script:RegistryNativeSource = @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 
 namespace AntiCheat
 {
@@ -756,138 +768,358 @@ namespace AntiCheat
             return QueryDosDeviceW(deviceName, target, target.Capacity) != 0 ? target.ToString() : null;
         }
     }
+
+    public static class RegistryTime
+    {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        private static extern int RegQueryInfoKeyW(SafeRegistryHandle key, IntPtr className, IntPtr classLength, IntPtr reserved,
+            IntPtr subKeys, IntPtr maxSubKeyLength, IntPtr maxClassLength, IntPtr values, IntPtr maxValueNameLength,
+            IntPtr maxValueLength, IntPtr securityDescriptor, out long lastWriteTime);
+
+        // Last write time of a registry key, or DateTime.MinValue.
+        public static DateTime LastWrite(RegistryKey key)
+        {
+            long fileTime;
+            if (RegQueryInfoKeyW(key.Handle, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
+                IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out fileTime) == 0 && fileTime > 0)
+            {
+                return DateTime.FromFileTime(fileTime);
+            }
+            return DateTime.MinValue;
+        }
+    }
 }
 '@
 
-# Maps \Device\HarddiskVolumeN\ prefixes to drive letters.
-function Get-DeviceMap {
-    $map = @{}
-    if (-not ('AntiCheat.DosDevice' -as [type])) {
-        try { Add-Type -TypeDefinition $script:DosDeviceSource -ErrorAction Stop } catch { return $map }
+$script:Artifacts = @{}
+$script:DeviceMap = @{}
+
+# Known folder GUIDs used by UserAssist paths.
+$script:KnownFolders = @{
+    '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}' = [Environment]::GetFolderPath('System')
+    '{D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27}' = [Environment]::GetFolderPath('SystemX86')
+    '{F38BF404-1D43-42F2-9305-67DE0B28FC23}' = $env:SystemRoot
+    '{6D809377-6AF0-444B-8957-A3773F02200E}' = $env:ProgramW6432
+    '{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}' = ${env:ProgramFiles(x86)}
+    '{374DE290-123F-4565-9164-39C4925E467B}' = (Join-Path $env:USERPROFILE 'Downloads')
+    '{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}' = [Environment]::GetFolderPath('Desktop')
+    '{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}' = $env:LOCALAPPDATA
+    '{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}' = $env:APPDATA
+    '{5E6C858F-0E22-4760-9AFE-EA3317B67173}' = $env:USERPROFILE
+    '{0762D272-C50A-4BB0-A382-697DCD729B80}' = (Split-Path $env:USERPROFILE -Parent)
+}
+
+function Initialize-RegistryNative {
+    if (-not ('AntiCheat.RegistryTime' -as [type])) {
+        try { Add-Type -TypeDefinition $script:RegistryNativeSource -ErrorAction Stop } catch { return $false }
     }
+    $script:DeviceMap = @{}
     foreach ($drive in [IO.DriveInfo]::GetDrives()) {
         $letter = $drive.Name.Substring(0, 2)
         $device = [AntiCheat.DosDevice]::Query($letter)
-        if ($device) { $map["$device\"] = "$letter\" }
+        if ($device) { $script:DeviceMap["$device\"] = "$letter\" }
     }
-    $map
+    $true
 }
 
-function Test-ExecutionHistory {
-    $cutoff = (Get-Date).AddDays(-$Config.HistoryDays)
-    $map    = Get-DeviceMap
-    $roots  = 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings',
-              'HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings'
+function ConvertTo-DosPath([string]$Path) {
+    if (-not $Path) { return $Path }
+    $Path = $Path.Trim().Trim('"')
+    if ($Path.StartsWith('\??\')) { $Path = $Path.Substring(4) }
+    foreach ($device in $script:DeviceMap.Keys) {
+        if ($Path.StartsWith($device, [StringComparison]::OrdinalIgnoreCase)) { return $script:DeviceMap[$device] + $Path.Substring($device.Length) }
+    }
+    if ($Path -match '^(\{[0-9A-Fa-f-]{36}\})(\\.*)$' -and $script:KnownFolders[$Matches[1].ToUpperInvariant()]) {
+        return $script:KnownFolders[$Matches[1].ToUpperInvariant()] + $Matches[2]
+    }
+    [Environment]::ExpandEnvironmentVariables($Path)
+}
 
-    # Background Activity Moderator: last run time per executable, per user.
-    $entries = @{}
-    $readable = $false
-    foreach ($root in $roots) {
+# Records one execution trace. Entries are merged per path across sources.
+function Add-Artifact([string]$Path, [string]$Source, $Time = $null, [string]$Sha1 = '') {
+    $Path = ConvertTo-DosPath $Path
+    if (-not $Path -or $Path.Length -lt 3) { return }
+    $key = $Path.ToLowerInvariant()
+    if (-not $script:Artifacts.ContainsKey($key)) {
+        $script:Artifacts[$key] = [pscustomobject]@{ Path = $Path; Sources = New-Object System.Collections.Generic.List[string]; LastRun = $null; Sha1 = '' }
+    }
+    $a = $script:Artifacts[$key]
+    if (-not $a.Sources.Contains($Source)) { $a.Sources.Add($Source) }
+    if ($Time -is [datetime] -and $Time.Year -gt 2000 -and (-not $a.LastRun -or $Time -gt $a.LastRun)) { $a.LastRun = $Time }
+    if ($Sha1) { $a.Sha1 = $Sha1.ToLowerInvariant() -replace '^0000', '' }
+}
+
+function Get-UserHives {
+    Get-ChildItem -LiteralPath 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' } |
+        ForEach-Object { $_.PSChildName }
+}
+
+function ConvertFrom-Rot13([string]$Text) {
+    $chars = $Text.ToCharArray()
+    for ($i = 0; $i -lt $chars.Length; $i++) {
+        $c = [int]$chars[$i]
+        if ($c -ge 65 -and $c -le 90)      { $chars[$i] = [char](65 + (($c - 65 + 13) % 26)) }
+        elseif ($c -ge 97 -and $c -le 122) { $chars[$i] = [char](97 + (($c - 97 + 13) % 26)) }
+    }
+    -join $chars
+}
+
+# --- Sources -----------------------------------------------------------------
+
+# AppCompatCache (Windows 8.1-11 "10ts" entries). Lists executables seen by the
+# shim engine; the timestamp is the file's modified time, not a run time.
+function Read-ShimCache {
+    $bytes = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache' -Name AppCompatCache -ErrorAction Stop).AppCompatCache
+    $offset = [BitConverter]::ToInt32($bytes, 0)
+    $count  = 0
+    while ($offset + 14 -lt $bytes.Length) {
+        if ([Text.Encoding]::ASCII.GetString($bytes, $offset, 4) -ne '10ts') { break }
+        $entrySize  = [BitConverter]::ToInt32($bytes, $offset + 8)
+        $pathLength = [BitConverter]::ToUInt16($bytes, $offset + 12)
+        if ($offset + 14 + $pathLength -gt $bytes.Length) { break }
+        $path = [Text.Encoding]::Unicode.GetString($bytes, $offset + 14, $pathLength)
+        if ($path -match '\\') { Add-Artifact $path 'ShimCache'; $count++ }
+        $offset += 12 + $entrySize
+    }
+    $count
+}
+
+# Amcache.hve is locked by Windows, so a shadow copy of it is loaded as a
+# temporary hive.
+function Read-Amcache {
+    $source = Join-Path $env:SystemRoot 'appcompat\Programs\Amcache.hve'
+    $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('amcache-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $hive   = Join-Path $tmpDir 'Amcache.hve'
+    $mount  = 'ACCheck_Amcache'
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+    $count  = 0
+    $loaded = $false
+    try {
+        & esentutl.exe /y $source /vss /d $hive *> $null
+        if (-not (Test-Path -LiteralPath $hive)) { throw 'copy failed' }
+        foreach ($log in 'LOG1', 'LOG2') {
+            if (Test-Path -LiteralPath "$source.$log") { & esentutl.exe /y "$source.$log" /vss /d "$hive.$log" *> $null }
+        }
+        & reg.exe load "HKLM\$mount" $hive *> $null
+        if ($LASTEXITCODE -ne 0) { throw 'load failed' }
+        $loaded = $true
+
+        $root = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$mount\Root\InventoryApplicationFile")
+        if ($root) {
+            foreach ($name in $root.GetSubKeyNames()) {
+                $k = $root.OpenSubKey($name)
+                if (-not $k) { continue }
+                $path = $k.GetValue('LowerCaseLongPath')
+                if ($path) { Add-Artifact $path 'Amcache' ([AntiCheat.RegistryTime]::LastWrite($k)) "$($k.GetValue('FileId'))"; $count++ }
+                $k.Close()
+            }
+            $root.Close()
+        }
+        else {
+            # Older layout: Root\File\{volume}\{entry} with value 15 = path, 101 = SHA1.
+            $files = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$mount\Root\File")
+            if ($files) {
+                foreach ($volume in $files.GetSubKeyNames()) {
+                    $v = $files.OpenSubKey($volume)
+                    foreach ($name in $v.GetSubKeyNames()) {
+                        $k = $v.OpenSubKey($name)
+                        $path = $k.GetValue('15')
+                        if ($path) { Add-Artifact $path 'Amcache' ([AntiCheat.RegistryTime]::LastWrite($k)) "$($k.GetValue('101'))"; $count++ }
+                        $k.Close()
+                    }
+                    $v.Close()
+                }
+                $files.Close()
+            }
+        }
+    }
+    finally {
+        if ($loaded) {
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+            & reg.exe unload "HKLM\$mount" *> $null
+        }
+        Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $loaded) { throw 'Amcache could not be loaded' }
+    $count
+}
+
+# Background Activity Moderator: last run time per executable, per user.
+function Read-Bam {
+    $count = 0
+    foreach ($root in 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings', 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings') {
         foreach ($userKey in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
-            $readable = $true
             foreach ($name in $userKey.GetValueNames()) {
                 if ($name -notmatch '^\\Device\\') { continue }
                 $data = $userKey.GetValue($name)
-                if (-not ($data -is [byte[]]) -or $data.Length -lt 8) { continue }
-                try { $time = [DateTime]::FromFileTime([BitConverter]::ToInt64($data, 0)) } catch { continue }
-                if ($time -lt $cutoff) { continue }
+                $time = $null
+                if ($data -is [byte[]] -and $data.Length -ge 8) { try { $time = [DateTime]::FromFileTime([BitConverter]::ToInt64($data, 0)) } catch { } }
+                Add-Artifact $name 'BAM' $time
+                $count++
+            }
+        }
+    }
+    $count
+}
 
-                $path = $name
-                foreach ($device in $map.Keys) {
-                    if ($name.StartsWith($device, [StringComparison]::OrdinalIgnoreCase)) { $path = $map[$device] + $name.Substring($device.Length); break }
+# UserAssist: programs started from Explorer (ROT13 names, run time at offset 60).
+function Read-UserAssist {
+    $count = 0
+    foreach ($sid in Get-UserHives) {
+        $base = "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"
+        foreach ($guidKey in @(Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue)) {
+            $countKey = Get-Item -LiteralPath (Join-Path $guidKey.PSPath 'Count') -ErrorAction SilentlyContinue
+            if (-not $countKey) { continue }
+            foreach ($name in $countKey.GetValueNames()) {
+                $decoded = ConvertFrom-Rot13 $name
+                if ($decoded -notmatch '\\') { continue }
+                $data = $countKey.GetValue($name)
+                $time = $null
+                if ($data -is [byte[]] -and $data.Length -ge 68) {
+                    $ft = [BitConverter]::ToInt64($data, 60)
+                    if ($ft -gt 0) { try { $time = [DateTime]::FromFileTime($ft) } catch { } }
                 }
-                if (-not $entries.ContainsKey($path) -or $entries[$path] -lt $time) { $entries[$path] = $time }
+                Add-Artifact $decoded 'UserAssist' $time
+                $count++
+            }
+        }
+    }
+    $count
+}
+
+# Value names that are executable paths (no timestamps).
+function Read-PathValueNames([string]$Source, [string]$SubPath, [string]$HiveSuffix = '', [string]$StripPattern = '') {
+    $count = 0
+    foreach ($sid in Get-UserHives) {
+        $key = Get-Item -LiteralPath "Registry::HKEY_USERS\$sid$HiveSuffix\$SubPath" -ErrorAction SilentlyContinue
+        if (-not $key) { continue }
+        foreach ($name in $key.GetValueNames()) {
+            if ($StripPattern) { $name = $name -replace $StripPattern, '' }
+            if ($name -notmatch '^([A-Za-z]:\\|\\\\|\\Device\\|%)') { continue }
+            Add-Artifact $name $Source
+            $count++
+        }
+    }
+    $count
+}
+
+# Commands typed into Win+R.
+function Read-RunMru {
+    $count = 0
+    foreach ($sid in Get-UserHives) {
+        $key = Get-Item -LiteralPath "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU" -ErrorAction SilentlyContinue
+        if (-not $key) { continue }
+        foreach ($name in $key.GetValueNames()) {
+            if ($name -eq 'MRUList') { continue }
+            $command = "$($key.GetValue($name))" -replace '\\1$', ''
+            if ($command) { Add-Artifact $command 'RunMRU'; $count++ }
+        }
+    }
+    $count
+}
+
+# --- Detection ---------------------------------------------------------------
+
+function Get-ArtifactReasons($Artifact) {
+    $path     = $Artifact.Path
+    $leaf     = ($path -split '\\')[-1]
+    $base     = [IO.Path]::GetFileNameWithoutExtension($leaf).ToLowerInvariant()
+    $ext      = [IO.Path]::GetExtension($leaf).ToLowerInvariant()
+    $isPath   = $path -match '^([A-Za-z]:\\|\\\\)'
+    $ignored  = $path -match $Config.RegistryIgnorePattern
+    $reasons  = New-Object System.Collections.Generic.List[string]
+    $critical = $false
+
+    # 1. Keywords in the file name.
+    if (-not $ignored) {
+        foreach ($word in $Config.RegistryKeywords) {
+            if ($base.Contains($word.ToLowerInvariant())) { $reasons.Add("keyword '$word'") }
+        }
+    }
+
+    # 2. Known cheat / tool names.
+    $category = Get-FlaggedCategory $base
+    if ($category -and $category -ne 'Remote access') { $reasons.Add($category) }
+
+    # 3. Known bad file hashes (Amcache SHA1).
+    if ($Artifact.Sha1 -and $Config.KnownBadSha1 -contains $Artifact.Sha1) { $reasons.Add('known bad hash'); $critical = $true }
+
+    if ($isPath -and -not $ignored) {
+        $suspiciousPlace = $path -match $Config.SuspiciousLocationPattern
+        $drive = $null
+        if ($path -match '^([A-Za-z]:\\)') { try { $drive = New-Object IO.DriveInfo $Matches[1] } catch { } }
+
+        # 4. Run from removable media or a network share.
+        if ($path.StartsWith('\\') -or ($drive -and "$($drive.DriveType)" -in 'Removable', 'Network')) {
+            $reasons.Add('removable/network drive')
+            $suspiciousPlace = $true
+        }
+
+        # 5. Executed file with a non-executable extension (renamed binary).
+        if ($ext -and $Config.ExecutableExtensions -notcontains $ext -and $Artifact.Sources -notcontains 'RunMRU') {
+            $reasons.Add("unusual extension '$ext'")
+        }
+
+        if ($suspiciousPlace) {
+            # 6. Random-looking file names (hex / GUID).
+            if ($base -match '^[0-9a-f]{8,}$|^\{?[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\}?$') { $reasons.Add('random name') }
+
+            # 7. Deleted after running, or unsigned.
+            if (-not (Test-Path -LiteralPath $path)) {
+                $reasons.Add('deleted')
+            }
+            else {
+                $sig = Get-FileSignature $path
+                if (-not $sig -or $sig.Status -ne 'Valid') { $reasons.Add('unsigned') }
             }
         }
     }
 
-    if (-not $readable) {
-        Write-Result WARN 'Execution history' 'Could not be read (requires administrator)'
-        return
-    }
-
-    $flaggedCount = 0
-    foreach ($path in ($entries.Keys | Sort-Object { $entries[$_] } -Descending)) {
-        $reasons = @()
-        $category = Get-FlaggedCategory ([IO.Path]::GetFileNameWithoutExtension($path))
-        if ($category -and $category -ne 'Remote access') { $reasons += $category }
-
-        $exists = [IO.Path]::IsPathRooted($path) -and (Test-Path -LiteralPath $path)
-        if (-not $exists -and $path -notmatch '^\\Device\\') {
-            $reasons += 'deleted after running'
-        }
-        elseif ($exists -and $path -match $Config.SuspiciousLocationPattern) {
-            $sig = Get-FileSignature $path
-            if (-not $sig -or $sig.Status -ne 'Valid') { $reasons += 'unsigned, ' + $(if ($sig) { "$($sig.Status)" } else { 'Unreadable' }) }
-        }
-
-        if ($reasons.Count -gt 0) {
-            $flaggedCount++
-            Write-Result WARN "Ran: $path" ("{0:yyyy-MM-dd HH:mm}, {1}" -f $entries[$path], ($reasons -join ', '))
-        }
-    }
-    if ($flaggedCount -eq 0) {
-        Write-Result PASS "Execution history ($($entries.Count) programs in $($Config.HistoryDays) days, none flagged)"
-    }
+    [pscustomobject]@{ Reasons = $reasons; Critical = $critical }
 }
 
-function Test-DefenderHistory {
-    $cutoff = (Get-Date).AddDays(-$Config.HistoryDays)
-    try {
-        $detections = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -ge $cutoff })
-    }
-    catch {
-        Write-Result WARN 'Defender detection history' 'Could not be read'
-        return
-    }
-    if ($detections.Count -eq 0) {
-        Write-Result PASS "No Defender detections in $($Config.HistoryDays) days"
-        return
-    }
-
-    $names = @{}
-    try { foreach ($t in @(Get-MpThreat -ErrorAction Stop)) { $names["$($t.ThreatID)"] = $t.ThreatName } } catch { }
-    foreach ($d in ($detections | Sort-Object InitialDetectionTime -Descending)) {
-        $name  = if ($names.ContainsKey("$($d.ThreatID)")) { $names["$($d.ThreatID)"] } else { "Threat ID $($d.ThreatID)" }
-        $where = (@($d.Resources) | ForEach-Object { "$_" -replace '^\w+:_', '' }) -join ', '
-        Write-Result WARN "Defender detection: $name" ("{0:yyyy-MM-dd HH:mm}, {1}" -f $d.InitialDetectionTime, $where)
-    }
-}
-
-function Test-LogTampering {
-    $cutoff = (Get-Date).AddDays(-$Config.HistoryDays)
-    $checks = @(
-        @{ Log = 'Security'; Id = 1102; Name = 'Security log' },
-        @{ Log = 'System';   Id = 104;  Name = 'System/Application logs' }
-    )
-    foreach ($c in $checks) {
-        try {
-            $cleared = @(Get-WinEvent -FilterHashtable @{ LogName = $c.Log; Id = $c.Id; StartTime = $cutoff } -ErrorAction Stop)
-            $latest  = $cleared | Sort-Object TimeCreated -Descending | Select-Object -First 1
-            Write-Result FAIL "$($c.Name) not cleared" ("cleared {0} time(s), last {1:yyyy-MM-dd HH:mm}" -f $cleared.Count, $latest.TimeCreated)
-        }
-        catch {
-            # Get-WinEvent throws when no events match.
-            if ("$($_.FullyQualifiedErrorId)" -match 'NoMatchingEventsFound') { Write-Result PASS "$($c.Name) not cleared" }
-            else { Write-Result WARN "$($c.Name) not cleared" 'Could not be read' }
-        }
-    }
-
-    # The current user's Recycle Bin folder changes when files are deleted or it is emptied.
-    try {
-        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $bin = Get-Item -LiteralPath (Join-Path $env:SystemDrive "`$Recycle.Bin\$sid") -Force -ErrorAction Stop
-        $items = @(Get-ChildItem -LiteralPath $bin.FullName -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' })
-        Write-Result INFO 'Recycle Bin' ("last changed {0:yyyy-MM-dd HH:mm}, {1} item(s)" -f $bin.LastWriteTime, [Math]::Floor($items.Count / 2))
-    }
-    catch { }
-}
-
-function Invoke-Step3History {
+function Invoke-Step3Registry {
     Write-Host ''
-    Test-ExecutionHistory
-    Test-DefenderHistory
-    Test-LogTampering
+    $script:Artifacts = @{}
+    if (-not (Initialize-RegistryNative)) {
+        Write-Result FAIL 'Registry check' 'Native helper could not be compiled'
+        return
+    }
+
+    $sources = [ordered]@{
+        'ShimCache'                     = { Read-ShimCache }
+        'Amcache'                       = { Read-Amcache }
+        'BAM'                           = { Read-Bam }
+        'UserAssist'                    = { Read-UserAssist }
+        'MUICache'                      = { Read-PathValueNames 'MUICache' 'Local Settings\Software\Microsoft\Windows\Shell\MuiCache' '_Classes' '\.(FriendlyAppName|ApplicationCompany)$' }
+        'Compatibility Assistant Store' = { Read-PathValueNames 'CompatStore' 'Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store' }
+        'FeatureUsage'                  = { (Read-PathValueNames 'FeatureUsage' 'Software\Microsoft\Windows\CurrentVersion\Explorer\FeatureUsage\AppSwitched') + (Read-PathValueNames 'FeatureUsage' 'Software\Microsoft\Windows\CurrentVersion\Explorer\FeatureUsage\AppLaunch') }
+        'RunMRU'                        = { Read-RunMru }
+    }
+    $failed = @()
+    foreach ($name in $sources.Keys) {
+        try { $null = & $sources[$name] } catch { $failed += $name }
+    }
+    foreach ($name in $failed) { Write-Result WARN "$name could not be read" }
+
+    $hits = foreach ($a in $script:Artifacts.Values) {
+        $r = Get-ArtifactReasons $a
+        if ($r.Reasons.Count -gt 0) { [pscustomobject]@{ Artifact = $a; Reasons = $r.Reasons; Critical = $r.Critical } }
+    }
+    $hits = @($hits | Sort-Object @{ Expression = { $_.Critical }; Descending = $true }, @{ Expression = { if ($_.Artifact.LastRun) { $_.Artifact.LastRun } else { [datetime]::MinValue } }; Descending = $true })
+
+    foreach ($h in $hits) {
+        $parts = @($h.Reasons -join ', ')
+        if ($h.Artifact.LastRun) { $parts += '{0:yyyy-MM-dd HH:mm}' -f $h.Artifact.LastRun }
+        $parts += ($h.Artifact.Sources -join ', ')
+        $status = if ($h.Critical) { 'FAIL' } else { 'WARN' }
+        Write-Result $status $h.Artifact.Path ($parts -join ' | ')
+    }
+    if ($hits.Count -eq 0) {
+        Write-Result PASS "Registry check ($($script:Artifacts.Count) entries, none flagged)"
+    }
 }
 
 # =============================================================================
@@ -902,7 +1134,7 @@ function Invoke-AntiCheatCheck {
         if ($PSCommandPath) {
             $argList = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
             if ($SkipProcessExplorer) { $argList += '-SkipProcessExplorer' }
-            if ($SkipHistory)         { $argList += '-SkipHistory' }
+            if ($SkipRegistry)        { $argList += '-SkipRegistry' }
         }
         else {
             # Started from memory via iex: download and run again in the elevated window.
@@ -928,10 +1160,10 @@ function Invoke-AntiCheatCheck {
         Invoke-Step2ProcessExplorer
     }
 
-    if (-not $SkipHistory) {
+    if (-not $SkipRegistry) {
         Write-Host ''
-        Read-Host 'Press Enter to continue to Step 3 (Execution History)' | Out-Null
-        Invoke-Step3History
+        Read-Host 'Press Enter to continue to Step 3 (Registry Check)' | Out-Null
+        Invoke-Step3Registry
     }
 }
 
