@@ -30,9 +30,7 @@ param(
     # Do not try to relaunch as administrator (some checks will be limited).
     [switch]$NoElevate,
     # Run Step 1 only.
-    [switch]$SkipProcessExplorer,
-    # Do not wait for Enter between steps / before exiting.
-    [switch]$NoPause
+    [switch]$SkipProcessExplorer
 )
 
 # =============================================================================
@@ -101,7 +99,6 @@ $Config = @{
 #  Output helpers
 # =============================================================================
 $script:Results         = New-Object System.Collections.Generic.List[object]
-$script:ReportLines     = New-Object System.Collections.Generic.List[string]
 $script:CategoryPenalty = @{}
 # Maximum points a single category can remove from the score.
 $script:PenaltyCaps     = @{
@@ -116,24 +113,6 @@ $script:SigCache        = @{}
 $script:ThirdPartyAv    = @()
 $script:FinalScore      = $null
 
-function Write-Line {
-    param([string]$Text = '', [string]$Colour = 'Gray', [switch]$NoNewline)
-    Write-Host $Text -ForegroundColor $Colour -NoNewline:$NoNewline
-    if (-not $NoNewline) { $script:ReportLines.Add($Text) }
-}
-
-function Write-Header([string]$Text) {
-    Write-Line ''
-    Write-Line ('=' * 72) DarkCyan
-    Write-Line "  $Text" Cyan
-    Write-Line ('=' * 72) DarkCyan
-}
-
-function Write-Section([string]$Text) {
-    Write-Line ''
-    Write-Line ("-- $Text " + ('-' * [Math]::Max(0, 68 - $Text.Length))) White
-}
-
 function Write-Result {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('PASS', 'WARN', 'FAIL', 'INFO')][string]$Status,
@@ -143,13 +122,10 @@ function Write-Result {
         [string]$Category = 'General'
     )
     $colour = @{ PASS = 'Green'; WARN = 'Yellow'; FAIL = 'Red'; INFO = 'Cyan' }[$Status]
-    $text   = if ($Detail) { "  [$Status] $Check - $Detail" } else { "  [$Status] $Check" }
-
-    Write-Host "  [$Status] " -ForegroundColor $colour -NoNewline
+    Write-Host "[$Status] " -ForegroundColor $colour -NoNewline
     if ($Status -eq 'INFO') { Write-Host $Check -ForegroundColor White -NoNewline }
     else { Write-Host $Check -ForegroundColor $colour -NoNewline }
-    if ($Detail) { Write-Host " - $Detail" -ForegroundColor Gray } else { Write-Host '' }
-    $script:ReportLines.Add($text)
+    if ($Detail -and $Status -ne 'PASS') { Write-Host " - $Detail" -ForegroundColor Gray } else { Write-Host '' }
 
     $applied = 0
     if ($Status -eq 'WARN' -or $Status -eq 'FAIL') {
@@ -167,7 +143,7 @@ function Write-Result {
 
 # Indented detail line under a result (e.g. each flagged item).
 function Write-Item([string]$Text, [string]$Colour = 'Gray') {
-    Write-Line "         - $Text" $Colour
+    Write-Host "       - $Text" -ForegroundColor $Colour
 }
 
 # =============================================================================
@@ -218,7 +194,6 @@ function Get-FlaggedPenalty([string]$Category) {
 #  Step 1 - System check
 # =============================================================================
 function Test-OperatingSystem {
-    Write-Section 'Operating system'
     $isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
     if (-not $isWindows) {
         Write-Result FAIL 'Operating system is Windows' ("Detected: {0}" -f [Environment]::OSVersion.VersionString) 100
@@ -228,8 +203,6 @@ function Test-OperatingSystem {
     try {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
         Write-Result PASS 'Operating system is Windows' ('{0} (build {1}, {2})' -f $os.Caption.Trim(), $os.BuildNumber, $os.OSArchitecture)
-        $uptime = (Get-Date) - $os.LastBootUpTime
-        Write-Result INFO 'Uptime' ('{0}d {1}h {2}m (last boot {3:yyyy-MM-dd HH:mm})' -f $uptime.Days, $uptime.Hours, $uptime.Minutes, $os.LastBootUpTime)
     }
     catch {
         Write-Result PASS 'Operating system is Windows' ([Environment]::OSVersion.VersionString)
@@ -243,7 +216,6 @@ function Test-OperatingSystem {
 }
 
 function Test-Hardware {
-    Write-Section 'Hardware'
     try {
         foreach ($cpu in @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)) {
             Write-Result INFO 'CPU' ('{0} ({1} cores / {2} threads)' -f $cpu.Name.Trim(), $cpu.NumberOfCores, $cpu.NumberOfLogicalProcessors)
@@ -257,16 +229,9 @@ function Test-Hardware {
         }
     }
     catch { Write-Result WARN 'GPU' 'Could not query the graphics adapter' 2 }
-
-    try {
-        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
-        Write-Result INFO 'Memory' ('{0:N1} GB' -f ($cs.TotalPhysicalMemory / 1GB))
-    }
-    catch { }
 }
 
 function Test-VirtualMachine {
-    Write-Section 'Virtual machine'
     $strong  = New-Object System.Collections.Generic.List[string]
     $weak    = New-Object System.Collections.Generic.List[string]
     $pattern = $Config.VmVendorPattern
@@ -285,9 +250,6 @@ function Test-VirtualMachine {
         }
         foreach ($key in $fields.Keys) {
             if ("$($fields[$key])" -match $pattern) { $strong.Add("$key = $($fields[$key])") }
-        }
-        if ($cs.HypervisorPresent) {
-            Write-Result INFO 'Hypervisor present' 'Normal when Hyper-V, WSL2 or Memory Integrity (VBS) is enabled'
         }
     }
     catch { $weak.Add('Could not read system/BIOS information') }
@@ -349,7 +311,6 @@ function Test-VirtualMachine {
 }
 
 function Test-Defender {
-    Write-Section 'Microsoft Defender'
 
     # Third-party antivirus registered with Windows Security Center.
     try {
@@ -357,9 +318,6 @@ function Test-Defender {
         $script:ThirdPartyAv = @($products | Where-Object {
                 $_.displayName -notmatch 'Defender' -and (($_.productState -band 0xF000) -eq 0x1000)
             } | ForEach-Object { $_.displayName })
-        if ($script:ThirdPartyAv.Count -gt 0) {
-            Write-Result INFO 'Third-party antivirus active' ($script:ThirdPartyAv -join ', ')
-        }
     }
     catch { }
 
@@ -444,7 +402,6 @@ function Test-Defender {
 }
 
 function Test-DefenderExclusions {
-    Write-Section 'Defender exclusions'
     $found      = New-Object System.Collections.Generic.List[string]
     $unreadable = New-Object System.Collections.Generic.List[string]
     $mpReadable = $false
@@ -500,9 +457,7 @@ function Test-DefenderExclusions {
 }
 
 function Test-Processes {
-    Write-Section 'Running processes'
     $procs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)
-    Write-Line "  Checking $($procs.Count) processes, please wait..." DarkGray
 
     $byPath  = @{}
     $flagged = New-Object System.Collections.Generic.List[object]
@@ -536,20 +491,14 @@ function Test-Processes {
     # Signatures.
     $suspiciousLocation = '\\AppData\\Local\\Temp\\|\\Windows\\Temp\\|\\Downloads\\|\\Desktop\\|\\Users\\Public\\|\\\$Recycle\.Bin\\|\\ProgramData\\[^\\]+\.exe$'
     $unsigned = New-Object System.Collections.Generic.List[object]
-    $i = 0
     foreach ($path in $byPath.Keys) {
-        $i++
-        Write-Progress -Activity 'Verifying process signatures' -Status $path -PercentComplete (($i / [Math]::Max(1, $byPath.Count)) * 100)
         $sig = Get-FileSignature $path
         $status = if ($sig) { "$($sig.Status)" } else { 'Unreadable' }
         if ($status -ne 'Valid') {
             $unsigned.Add([pscustomobject]@{ Path = $path; Status = $status; Pids = ($byPath[$path] -join ','); Suspicious = ($path -match $suspiciousLocation) })
         }
     }
-    Write-Progress -Activity 'Verifying process signatures' -Completed
 
-    $signedCount = $byPath.Count - $unsigned.Count
-    Write-Result PASS 'Signed executables' "$signedCount of $($byPath.Count) unique executables have a valid signature"
     if ($unsigned.Count -gt 0) {
         foreach ($u in ($unsigned | Sort-Object -Property @{ Expression = 'Suspicious'; Descending = $true }, Path)) {
             $label   = if ($u.Suspicious) { 'Unsigned in unusual location' } else { 'Unsigned / untrusted process' }
@@ -560,13 +509,9 @@ function Test-Processes {
     else {
         Write-Result PASS 'All running processes are signed'
     }
-
-    $roblox = @(Get-Process -Name 'RobloxPlayerBeta', 'Windows10Universal', 'RobloxStudioBeta' -ErrorAction SilentlyContinue)
-    if ($roblox.Count -gt 0) { Write-Result INFO 'Roblox running' (($roblox | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ', ') }
 }
 
 function Test-Prefetch {
-    Write-Section 'Execution history (Prefetch)'
     $prefetch = Join-Path $env:SystemRoot 'Prefetch'
     try {
         $files = @(Get-ChildItem -LiteralPath $prefetch -Filter '*.pf' -ErrorAction Stop)
@@ -597,7 +542,6 @@ function Test-Prefetch {
 }
 
 function Test-Folders {
-    Write-Section 'Known cheat folders'
     $hits = 0
     foreach ($root in @($env:APPDATA, $env:LOCALAPPDATA) | Where-Object { $_ }) {
         foreach ($name in $Config.FlaggedFolders) {
@@ -612,7 +556,6 @@ function Test-Folders {
 }
 
 function Test-Drivers {
-    Write-Section 'Kernel drivers'
     try {
         $drivers = @(Get-CimInstance -ClassName Win32_SystemDriver -Filter "State='Running'" -ErrorAction Stop)
     }
@@ -647,14 +590,6 @@ function Test-Drivers {
 }
 
 function Test-PowerShellIntegrity {
-    Write-Section 'PowerShell integrity'
-    Write-Result INFO 'PowerShell' ("{0} {1}, {2} language mode" -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion, $ExecutionContext.SessionState.LanguageMode)
-
-    if ($PSCommandPath) {
-        $hash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
-        Write-Result INFO 'Script SHA256' "$hash (compare with the hash published by staff)"
-    }
-
     # The host executable must be Microsoft-signed.
     $hostPath = (Get-Process -Id $PID).Path
     $hostSig  = Get-FileSignature $hostPath
@@ -728,7 +663,6 @@ function Test-PowerShellIntegrity {
 }
 
 function Test-SystemIntegrity {
-    Write-Section 'Boot and system integrity'
 
     # Options of the current boot (locale independent, unlike bcdedit output).
     $startOptions = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name SystemStartOptions -ErrorAction SilentlyContinue).SystemStartOptions
@@ -747,13 +681,6 @@ function Test-SystemIntegrity {
         else { Write-Result WARN 'Secure Boot' 'Disabled' 3 }
     }
     catch { Write-Result WARN 'Secure Boot' 'Not supported or could not be read (legacy BIOS / not administrator)' 2 }
-
-    try {
-        $dg = Get-CimInstance -Namespace 'root/Microsoft/Windows/DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop
-        $hvci = @($dg.SecurityServicesRunning) -contains 2
-        Write-Result INFO 'Memory integrity (HVCI)' $(if ($hvci) { 'Running' } else { 'Not running' })
-    }
-    catch { }
 
     try {
         $off = @(Get-NetFirewallProfile -ErrorAction Stop | Where-Object { -not $_.Enabled })
@@ -778,49 +705,17 @@ function Show-SafetyScore {
     $penalty = ($script:Results | Measure-Object -Property Penalty -Sum).Sum
     $score   = [int][Math]::Max(0, [Math]::Min(100, 100 - $penalty))
     $fails   = @($script:Results | Where-Object Status -eq 'FAIL').Count
-    $warns   = @($script:Results | Where-Object Status -eq 'WARN').Count
 
-    if ($score -ge 90 -and $fails -eq 0) { $colour = 'Green';  $rating = 'SAFE' }
-    elseif ($score -ge 70)               { $colour = 'Yellow'; $rating = 'REVIEW' }
-    else                                 { $colour = 'Red';    $rating = 'UNSAFE' }
+    if ($score -ge 90 -and $fails -eq 0) { $colour = 'Green' }
+    elseif ($score -ge 70)               { $colour = 'Yellow' }
+    else                                 { $colour = 'Red' }
 
-    Write-Header 'SAFETY SCORE'
-    Write-Line ("  {0} / 100  -  {1}" -f $score, $rating) $colour
-    Write-Line ("  {0} failed (red), {1} flagged for review (yellow)" -f $fails, $warns) Gray
-
-    if ($fails + $warns -gt 0) {
-        Write-Line ''
-        Write-Line '  Points deducted:' White
-        foreach ($r in ($script:Results | Where-Object { $_.Penalty -gt 0 } | Sort-Object Penalty -Descending)) {
-            $c = if ($r.Status -eq 'FAIL') { 'Red' } else { 'Yellow' }
-            Write-Line ("    -{0,-3} {1}" -f $r.Penalty, $r.Check) $c
-        }
-    }
+    Write-Host ''
+    Write-Host ("Safety Score: {0}/100" -f $score) -ForegroundColor $colour
     $script:FinalScore = $score
 }
 
-function Save-Report([int]$Score) {
-    try {
-        $desktop = [Environment]::GetFolderPath('Desktop')
-        $file    = Join-Path $desktop ("AntiCheat-Report-{0:yyyyMMdd-HHmmss}.txt" -f (Get-Date))
-        $header  = @(
-            "Anti-Cheat PC Check v$($Config.ScriptVersion)",
-            "Date:     $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')",
-            "Computer: $env:COMPUTERNAME   User: $env:USERNAME",
-            "Score:    $Score / 100",
-            ''
-        )
-        ($header + $script:ReportLines) | Set-Content -LiteralPath $file -Encoding UTF8
-        Write-Line ''
-        Write-Line "  Report saved to: $file" DarkGray
-    }
-    catch {
-        Write-Line "  Could not save report: $($_.Exception.Message)" DarkGray
-    }
-}
-
 function Invoke-Step1SystemCheck {
-    Write-Header 'STEP 1 - SYSTEM CHECK'
 
     $script:FinalScore = $null
     if (-not (Test-OperatingSystem)) {
@@ -844,14 +739,13 @@ function Invoke-Step1SystemCheck {
     Test-SystemIntegrity
 
     Show-SafetyScore
-    Save-Report $script:FinalScore
 }
 
 # =============================================================================
 #  Step 2 - Process Explorer
 # =============================================================================
 function Invoke-Step2ProcessExplorer {
-    Write-Header 'STEP 2 - PROCESS EXPLORER (SYSINTERNALS)'
+    Write-Host ''
 
     $exe = switch ($env:PROCESSOR_ARCHITECTURE) {
         'ARM64' { 'procexp64a.exe' }
@@ -863,7 +757,6 @@ function Invoke-Step2ProcessExplorer {
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
     try {
-        Write-Line "  Downloading $exe from Sysinternals Live..." Gray
         $oldProgress = $ProgressPreference
         $ProgressPreference = 'SilentlyContinue'
         try {
@@ -883,13 +776,8 @@ function Invoke-Step2ProcessExplorer {
             Write-Result FAIL 'Process Explorer signature' "Not a valid Microsoft signature [$($sig.Status)] - not launched"
             return
         }
-        Write-Result PASS 'Process Explorer signature' "Signed by $(Get-SignerName $sig)"
-
         $proc = Start-Process -FilePath $target -ArgumentList '/accepteula' -PassThru -ErrorAction Stop
-        Write-Result PASS 'Process Explorer launched' "PID $($proc.Id)"
-        Write-Line ''
-        Write-Line '  Keep Process Explorer open and follow the staff member''s instructions.' Cyan
-        Write-Line '  This window will continue when Process Explorer is closed.' Cyan
+        Write-Result PASS 'Process Explorer'
         $proc.WaitForExit()
     }
     catch {
@@ -910,52 +798,30 @@ function Invoke-AntiCheatCheck {
     $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 
     if ($onWindows -and -not $NoElevate -and -not (Test-IsAdmin)) {
-        Write-Host 'Requesting administrator rights (needed for the full check)...' -ForegroundColor Yellow
         if ($PSCommandPath) {
-            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+            $argList = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
             if ($SkipProcessExplorer) { $argList += '-SkipProcessExplorer' }
-            if ($NoPause)             { $argList += '-NoPause' }
         }
         else {
             # Started from memory via iex: download and run again in the elevated window.
-            $command = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; irm '$($Config.ScriptUrl)' | iex"
-            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "`"$command`"")
+            $command = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; iex (iwr '$($Config.ScriptUrl)' -UseBasicParsing).Content"
+            $argList = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "`"$command`"")
         }
         try {
             Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $argList -Verb RunAs -ErrorAction Stop
-            Write-Host 'The check is continuing in the new administrator window.' -ForegroundColor Cyan
             return
         }
-        catch {
-            Write-Host 'Administrator rights were declined - continuing with limited checks.' -ForegroundColor Yellow
-        }
+        catch { }
     }
 
-    try { $Host.UI.RawUI.WindowTitle = "Anti-Cheat PC Check v$($Config.ScriptVersion)" } catch { }
-
-    Write-Header "ANTI-CHEAT PC CHECK v$($Config.ScriptVersion)"
-    Write-Host '  ' -NoNewline
-    Write-Host '[PASS] passed' -ForegroundColor Green -NoNewline
-    Write-Host '   ' -NoNewline
-    Write-Host '[WARN] staff review' -ForegroundColor Yellow -NoNewline
-    Write-Host '   ' -NoNewline
-    Write-Host '[FAIL] failed' -ForegroundColor Red -NoNewline
-    Write-Host '   ' -NoNewline
-    Write-Host '[INFO] information' -ForegroundColor Cyan
+    try { $Host.UI.RawUI.WindowTitle = 'Anti-Cheat PC Check' } catch { }
+    Clear-Host
 
     Invoke-Step1SystemCheck | Out-Null
 
     if ($null -ne $script:FinalScore -and -not $SkipProcessExplorer) {
-        if (-not $NoPause) {
-            Write-Host ''
-            Read-Host '  Press Enter to continue to Step 2 (Process Explorer)' | Out-Null
-        }
         Invoke-Step2ProcessExplorer
     }
-
-    Write-Host ''
-    Write-Host '  Check complete. Show this window and the saved report to staff.' -ForegroundColor Cyan
-    if (-not $NoPause) { Read-Host '  Press Enter to exit' | Out-Null }
 }
 
 Invoke-AntiCheatCheck
