@@ -1,4 +1,3 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
     Community Anti-Cheat PC Check.
@@ -21,6 +20,8 @@
         RED    [FAIL]  check failed
         CYAN   [INFO]  information only
 
+.EXAMPLE
+    irm https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/AntiCheatCheck.ps1 | iex
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\AntiCheatCheck.ps1
 #>
@@ -87,6 +88,10 @@ $Config = @{
 
     # MAC address prefixes registered to hypervisor vendors.
     VmMacPrefixes = @('00:05:69', '00:0C:29', '00:1C:14', '00:50:56', '08:00:27', '0A:00:27', '00:15:5D', '00:1C:42', '00:16:3E', '52:54:00')
+
+    # Where this script is hosted. Used to relaunch as administrator when it
+    # was started with "irm ... | iex" (there is no file to relaunch).
+    ScriptUrl = 'https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/AntiCheatCheck.ps1'
 
     # Sysinternals live download location for Step 2.
     SysinternalsLive = 'https://live.sysinternals.com'
@@ -899,49 +904,58 @@ function Invoke-Step2ProcessExplorer {
 # =============================================================================
 #  Main
 # =============================================================================
-$onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+# Wrapped in a function so "return" ends the check without closing the
+# player's PowerShell window when the script is run with "irm ... | iex".
+function Invoke-AntiCheatCheck {
+    $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 
-if ($onWindows -and -not $NoElevate -and -not (Test-IsAdmin)) {
-    if ($PSCommandPath) {
+    if ($onWindows -and -not $NoElevate -and -not (Test-IsAdmin)) {
         Write-Host 'Requesting administrator rights (needed for the full check)...' -ForegroundColor Yellow
-        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
-        if ($SkipProcessExplorer) { $argList += '-SkipProcessExplorer' }
-        if ($NoPause)             { $argList += '-NoPause' }
+        if ($PSCommandPath) {
+            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+            if ($SkipProcessExplorer) { $argList += '-SkipProcessExplorer' }
+            if ($NoPause)             { $argList += '-NoPause' }
+        }
+        else {
+            # Started from memory via iex: download and run again in the elevated window.
+            $command = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; irm '$($Config.ScriptUrl)' | iex"
+            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "`"$command`"")
+        }
         try {
             Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $argList -Verb RunAs -ErrorAction Stop
-            exit
+            Write-Host 'The check is continuing in the new administrator window.' -ForegroundColor Cyan
+            return
         }
         catch {
             Write-Host 'Administrator rights were declined - continuing with limited checks.' -ForegroundColor Yellow
         }
     }
-    else {
-        Write-Host 'Not running as administrator and cannot relaunch (script was not run from a file).' -ForegroundColor Yellow
+
+    try { $Host.UI.RawUI.WindowTitle = "Anti-Cheat PC Check v$($Config.ScriptVersion)" } catch { }
+
+    Write-Header "ANTI-CHEAT PC CHECK v$($Config.ScriptVersion)"
+    Write-Host '  ' -NoNewline
+    Write-Host '[PASS] passed' -ForegroundColor Green -NoNewline
+    Write-Host '   ' -NoNewline
+    Write-Host '[WARN] staff review' -ForegroundColor Yellow -NoNewline
+    Write-Host '   ' -NoNewline
+    Write-Host '[FAIL] failed' -ForegroundColor Red -NoNewline
+    Write-Host '   ' -NoNewline
+    Write-Host '[INFO] information' -ForegroundColor Cyan
+
+    Invoke-Step1SystemCheck | Out-Null
+
+    if ($null -ne $script:FinalScore -and -not $SkipProcessExplorer) {
+        if (-not $NoPause) {
+            Write-Host ''
+            Read-Host '  Press Enter to continue to Step 2 (Process Explorer)' | Out-Null
+        }
+        Invoke-Step2ProcessExplorer
     }
+
+    Write-Host ''
+    Write-Host '  Check complete. Show this window and the saved report to staff.' -ForegroundColor Cyan
+    if (-not $NoPause) { Read-Host '  Press Enter to exit' | Out-Null }
 }
 
-try { $Host.UI.RawUI.WindowTitle = "Anti-Cheat PC Check v$($Config.ScriptVersion)" } catch { }
-
-Write-Header "ANTI-CHEAT PC CHECK v$($Config.ScriptVersion)"
-Write-Host '  ' -NoNewline
-Write-Host '[PASS] passed' -ForegroundColor Green -NoNewline
-Write-Host '   ' -NoNewline
-Write-Host '[WARN] staff review' -ForegroundColor Yellow -NoNewline
-Write-Host '   ' -NoNewline
-Write-Host '[FAIL] failed' -ForegroundColor Red -NoNewline
-Write-Host '   ' -NoNewline
-Write-Host '[INFO] information' -ForegroundColor Cyan
-
-Invoke-Step1SystemCheck | Out-Null
-
-if ($null -ne $script:FinalScore -and -not $SkipProcessExplorer) {
-    if (-not $NoPause) {
-        Write-Host ''
-        Read-Host '  Press Enter to continue to Step 2 (Process Explorer)' | Out-Null
-    }
-    Invoke-Step2ProcessExplorer
-}
-
-Write-Host ''
-Write-Host '  Check complete. Show this window and the saved report to staff.' -ForegroundColor Cyan
-if (-not $NoPause) { Read-Host '  Press Enter to exit' | Out-Null }
+Invoke-AntiCheatCheck

@@ -6,15 +6,21 @@ Colour key: **green** `[PASS]` = pass, **yellow** `[WARN]` = flagged for staff r
 
 ## Running
 
-Right-click Start, open **Terminal / PowerShell**, go to the folder with the script and run:
+Players paste this into PowerShell (no download or file needed):
+
+```powershell
+irm https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/AntiCheatCheck.ps1 | iex
+```
+
+If the window is not elevated, the script opens a new administrator PowerShell window that downloads and runs the script again (from `ScriptUrl` in `$Config`). Update `ScriptUrl` and the command above if the script moves, for example to `main`. The repository must be public for this to work.
+
+Running from a saved file also works:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\AntiCheatCheck.ps1
 ```
 
-The script asks for administrator rights (needed for exclusions, Prefetch, Secure Boot and similar checks) and restarts itself elevated with `-NoProfile`.
-
-Options: `-SkipProcessExplorer` (Step 1 only), `-NoElevate`, `-NoPause`.
+Options (file mode only): `-SkipProcessExplorer` (Step 1 only), `-NoElevate`, `-NoPause`.
 
 ## Step 1 - System check
 
