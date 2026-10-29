@@ -3,7 +3,7 @@
     Community Anti-Cheat Live Monitor.
 
 .DESCRIPTION
-    Prints one line per event, with time, PID and path, until Ctrl+C:
+    Prints one line per event, with time, PID and path:
 
         FILE CREATED / FILE DELETED / FILE RENAMED
             Temp, Windows\Temp, Prefetch, Downloads, Desktop, Recent,
@@ -771,10 +771,10 @@ function Invoke-LiveMonitor {
 
     $useEtw = Test-IsAdmin
     if ($useEtw) {
-        Write-Host 'Live monitor - press Ctrl+C to stop' -ForegroundColor Cyan
+        Write-Host 'Live monitor' -ForegroundColor Cyan
     }
     else {
-        Write-Host 'Live monitor (limited: not administrator, file events have no PID) - press Ctrl+C to stop' -ForegroundColor Yellow
+        Write-Host 'Live monitor (limited: not administrator, file events have no PID)' -ForegroundColor Yellow
     }
     Write-Host ('{0,-12}  {1,-14} {2,-7} {3}' -f 'TIME', 'EVENT', 'PID', 'PATH') -ForegroundColor White
 

@@ -14,6 +14,11 @@
         signature is verified, it is launched for staff review and the
         temporary copy is removed once it is closed.
 
+    Step 3 - Execution history and tampering
+        Programs run in the last days (Background Activity Moderator registry),
+        including ones deleted since, Microsoft Defender detections, cleared
+        event logs and the last Recycle Bin change.
+
     The live monitor is a separate script: LiveMonitor.ps1.
 
     Colour key:
@@ -32,7 +37,9 @@ param(
     # Do not try to relaunch as administrator (some checks will be limited).
     [switch]$NoElevate,
     # Skip Step 2.
-    [switch]$SkipProcessExplorer
+    [switch]$SkipProcessExplorer,
+    # Skip Step 3.
+    [switch]$SkipHistory
 )
 
 # =============================================================================
@@ -92,6 +99,12 @@ $Config = @{
     # Where this script is hosted. Used to relaunch as administrator when it
     # was started with "irm ... | iex" (there is no file to relaunch).
     ScriptUrl = 'https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/AntiCheatCheck.ps1'
+
+    # Executables in these locations are treated as higher risk when unsigned (regex).
+    SuspiciousLocationPattern = '\\AppData\\Local\\Temp\\|\\Windows\\Temp\\|\\Downloads\\|\\Desktop\\|\\Users\\Public\\|\\\$Recycle\.Bin\\|\\ProgramData\\[^\\]+\.exe$'
+
+    # How far back Step 3 looks, in days.
+    HistoryDays = 7
 
     # Sysinternals live download location for Step 2.
     SysinternalsLive = 'https://live.sysinternals.com'
@@ -584,7 +597,7 @@ function Test-Processes {
     }
 
     # Signatures.
-    $suspiciousLocation = '\\AppData\\Local\\Temp\\|\\Windows\\Temp\\|\\Downloads\\|\\Desktop\\|\\Users\\Public\\|\\\$Recycle\.Bin\\|\\ProgramData\\[^\\]+\.exe$'
+    $suspiciousLocation = $Config.SuspiciousLocationPattern
     $unsigned = New-Object System.Collections.Generic.List[object]
     foreach ($path in $byPath.Keys) {
         $sig = Get-FileSignature $path
@@ -885,6 +898,161 @@ function Invoke-Step2ProcessExplorer {
 }
 
 # =============================================================================
+#  Step 3 - Execution history and tampering
+# =============================================================================
+$script:DosDeviceSource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace AntiCheat
+{
+    public static class DosDevice
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern uint QueryDosDeviceW(string deviceName, StringBuilder targetPath, int max);
+
+        public static string Query(string deviceName)
+        {
+            StringBuilder target = new StringBuilder(1024);
+            return QueryDosDeviceW(deviceName, target, target.Capacity) != 0 ? target.ToString() : null;
+        }
+    }
+}
+'@
+
+# Maps \Device\HarddiskVolumeN\ prefixes to drive letters.
+function Get-DeviceMap {
+    $map = @{}
+    if (-not ('AntiCheat.DosDevice' -as [type])) {
+        try { Add-Type -TypeDefinition $script:DosDeviceSource -ErrorAction Stop } catch { return $map }
+    }
+    foreach ($drive in [IO.DriveInfo]::GetDrives()) {
+        $letter = $drive.Name.Substring(0, 2)
+        $device = [AntiCheat.DosDevice]::Query($letter)
+        if ($device) { $map["$device\"] = "$letter\" }
+    }
+    $map
+}
+
+function Test-ExecutionHistory {
+    $cutoff = (Get-Date).AddDays(-$Config.HistoryDays)
+    $map    = Get-DeviceMap
+    $roots  = 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings',
+              'HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings'
+
+    # Background Activity Moderator: last run time per executable, per user.
+    $entries = @{}
+    $readable = $false
+    foreach ($root in $roots) {
+        foreach ($userKey in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+            $readable = $true
+            foreach ($name in $userKey.GetValueNames()) {
+                if ($name -notmatch '^\\Device\\') { continue }
+                $data = $userKey.GetValue($name)
+                if (-not ($data -is [byte[]]) -or $data.Length -lt 8) { continue }
+                try { $time = [DateTime]::FromFileTime([BitConverter]::ToInt64($data, 0)) } catch { continue }
+                if ($time -lt $cutoff) { continue }
+
+                $path = $name
+                foreach ($device in $map.Keys) {
+                    if ($name.StartsWith($device, [StringComparison]::OrdinalIgnoreCase)) { $path = $map[$device] + $name.Substring($device.Length); break }
+                }
+                if (-not $entries.ContainsKey($path) -or $entries[$path] -lt $time) { $entries[$path] = $time }
+            }
+        }
+    }
+
+    if (-not $readable) {
+        Write-Result WARN 'Execution history' 'Could not be read (requires administrator)'
+        return
+    }
+
+    $flaggedCount = 0
+    foreach ($path in ($entries.Keys | Sort-Object { $entries[$_] } -Descending)) {
+        $reasons = @()
+        $category = Get-FlaggedCategory ([IO.Path]::GetFileNameWithoutExtension($path))
+        if ($category -and $category -ne 'Remote access') { $reasons += $category }
+
+        $exists = [IO.Path]::IsPathRooted($path) -and (Test-Path -LiteralPath $path)
+        if (-not $exists -and $path -notmatch '^\\Device\\') {
+            $reasons += 'deleted after running'
+        }
+        elseif ($exists -and $path -match $Config.SuspiciousLocationPattern) {
+            $sig = Get-FileSignature $path
+            if (-not $sig -or $sig.Status -ne 'Valid') { $reasons += 'unsigned, ' + $(if ($sig) { "$($sig.Status)" } else { 'Unreadable' }) }
+        }
+
+        if ($reasons.Count -gt 0) {
+            $flaggedCount++
+            Write-Result WARN "Ran: $path" ("{0:yyyy-MM-dd HH:mm}, {1}" -f $entries[$path], ($reasons -join ', '))
+        }
+    }
+    if ($flaggedCount -eq 0) {
+        Write-Result PASS "Execution history ($($entries.Count) programs in $($Config.HistoryDays) days, none flagged)"
+    }
+}
+
+function Test-DefenderHistory {
+    $cutoff = (Get-Date).AddDays(-$Config.HistoryDays)
+    try {
+        $detections = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -ge $cutoff })
+    }
+    catch {
+        Write-Result WARN 'Defender detection history' 'Could not be read'
+        return
+    }
+    if ($detections.Count -eq 0) {
+        Write-Result PASS "No Defender detections in $($Config.HistoryDays) days"
+        return
+    }
+
+    $names = @{}
+    try { foreach ($t in @(Get-MpThreat -ErrorAction Stop)) { $names["$($t.ThreatID)"] = $t.ThreatName } } catch { }
+    foreach ($d in ($detections | Sort-Object InitialDetectionTime -Descending)) {
+        $name  = if ($names.ContainsKey("$($d.ThreatID)")) { $names["$($d.ThreatID)"] } else { "Threat ID $($d.ThreatID)" }
+        $where = (@($d.Resources) | ForEach-Object { "$_" -replace '^\w+:_', '' }) -join ', '
+        Write-Result WARN "Defender detection: $name" ("{0:yyyy-MM-dd HH:mm}, {1}" -f $d.InitialDetectionTime, $where)
+    }
+}
+
+function Test-LogTampering {
+    $cutoff = (Get-Date).AddDays(-$Config.HistoryDays)
+    $checks = @(
+        @{ Log = 'Security'; Id = 1102; Name = 'Security log' },
+        @{ Log = 'System';   Id = 104;  Name = 'System/Application logs' }
+    )
+    foreach ($c in $checks) {
+        try {
+            $cleared = @(Get-WinEvent -FilterHashtable @{ LogName = $c.Log; Id = $c.Id; StartTime = $cutoff } -ErrorAction Stop)
+            $latest  = $cleared | Sort-Object TimeCreated -Descending | Select-Object -First 1
+            Write-Result FAIL "$($c.Name) not cleared" ("cleared {0} time(s), last {1:yyyy-MM-dd HH:mm}" -f $cleared.Count, $latest.TimeCreated)
+        }
+        catch {
+            # Get-WinEvent throws when no events match.
+            if ("$($_.FullyQualifiedErrorId)" -match 'NoMatchingEventsFound') { Write-Result PASS "$($c.Name) not cleared" }
+            else { Write-Result WARN "$($c.Name) not cleared" 'Could not be read' }
+        }
+    }
+
+    # The current user's Recycle Bin folder changes when files are deleted or it is emptied.
+    try {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $bin = Get-Item -LiteralPath (Join-Path $env:SystemDrive "`$Recycle.Bin\$sid") -Force -ErrorAction Stop
+        $items = @(Get-ChildItem -LiteralPath $bin.FullName -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' })
+        Write-Result INFO 'Recycle Bin' ("last changed {0:yyyy-MM-dd HH:mm}, {1} item(s)" -f $bin.LastWriteTime, [Math]::Floor($items.Count / 2))
+    }
+    catch { }
+}
+
+function Invoke-Step3History {
+    Write-Host ''
+    Test-ExecutionHistory
+    Test-DefenderHistory
+    Test-LogTampering
+}
+
+# =============================================================================
 #  Main
 # =============================================================================
 # Wrapped in a function so "return" ends the check without closing the
@@ -896,6 +1064,7 @@ function Invoke-AntiCheatCheck {
         if ($PSCommandPath) {
             $argList = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
             if ($SkipProcessExplorer) { $argList += '-SkipProcessExplorer' }
+            if ($SkipHistory)         { $argList += '-SkipHistory' }
         }
         else {
             # Started from memory via iex: download and run again in the elevated window.
@@ -919,6 +1088,12 @@ function Invoke-AntiCheatCheck {
         Write-Host ''
         Read-Host 'Press Enter to continue to Step 2 (Process Explorer)' | Out-Null
         Invoke-Step2ProcessExplorer
+    }
+
+    if (-not $SkipHistory) {
+        Write-Host ''
+        Read-Host 'Press Enter to continue to Step 3 (Execution History)' | Out-Null
+        Invoke-Step3History
     }
 }
 

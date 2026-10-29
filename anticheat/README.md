@@ -20,7 +20,7 @@ Running from a saved file also works:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\AntiCheatCheck.ps1
 ```
 
-Options (file mode only): `-SkipProcessExplorer`, `-NoElevate`.
+Options (file mode only): `-SkipProcessExplorer`, `-SkipHistory`, `-NoElevate`.
 
 Output is results only: one line per check, the flagged items under it, then the safety score.
 
@@ -48,6 +48,19 @@ The AMSI check runs Microsoft's harmless "AMSI test sample", so Windows Security
 
 After Step 1 the player presses Enter. The script downloads `procexp64.exe` (or the ARM64/x86 build) from `live.sysinternals.com` into a temporary folder, checks it has a valid Microsoft signature and launches it. Nothing is installed. When Process Explorer is closed, the temporary copy is deleted.
 
+## Step 3 - Execution history and tampering
+
+After Process Explorer is closed, the player presses Enter. This step looks back 7 days (`HistoryDays` in `$Config`):
+
+| Check | Result |
+|---|---|
+| Programs run, from the Background Activity Moderator (`bam`) registry, including other user accounts. Only flagged ones are listed: known cheat/tool/macro names, executables **deleted after running**, and unsigned executables run from Temp/Downloads/Desktop and similar. | yellow per program, green if none |
+| Microsoft Defender detections (threat name, time, file) | yellow per detection |
+| Security log cleared (event 1102), other logs cleared (event 104) | red |
+| Recycle Bin last changed and item count | info |
+
+This step runs after the safety score, so it does not change it.
+
 ## Live monitor (`LiveMonitor.ps1`)
 
 The live monitor is a separate script:
@@ -56,7 +69,7 @@ The live monitor is a separate script:
 iex (iwr "https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/LiveMonitor.ps1" -UseBasicParsing).Content
 ```
 
-It relaunches itself as administrator the same way as the main check. It prints one line per event with the time, event, PID and path, until Ctrl+C is pressed:
+It relaunches itself as administrator the same way as the main check. It prints one line per event with the time, event, PID and path:
 
 | Event | Colour |
 |---|---|
@@ -67,7 +80,7 @@ It relaunches itself as administrator the same way as the main check. It prints 
 
 As administrator on 64-bit Windows, the monitor uses the Windows Kernel-File and Kernel-Process event tracing (ETW) providers. This gives the PID for file events and catches processes that only run for a moment. Without that, it falls back to folder watchers and WMI. In that mode file events show `-` for PID and drivers are not reported, and a yellow line at the top says so.
 
-The ETW session is called `AntiCheatLiveMonitor`. Ctrl+C stops it. If the window is closed with the X instead, the session keeps running until the next time the monitor starts (it stops any old session first) or until `logman stop AntiCheatLiveMonitor -ets` is run.
+The ETW session is called `AntiCheatLiveMonitor`. Staff stop the monitor with Ctrl+C, which also stops the session. If the window is closed with the X instead, the session keeps running until the next time the monitor starts (it stops any old session first) or until `logman stop AntiCheatLiveMonitor -ets` is run.
 
 ## Tuning
 
