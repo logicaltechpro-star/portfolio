@@ -11,15 +11,10 @@
 
     Step 2 - Process Explorer (Sysinternals)
         Downloaded to a temporary folder (nothing is installed), its Microsoft
-        signature is verified and it is launched for staff review. The
-        temporary copy is removed when the live monitor stops.
+        signature is verified, it is launched for staff review and the
+        temporary copy is removed once it is closed.
 
-    Step 3 - Live monitor
-        Shows, with time, PID and path: files created / deleted / renamed in
-        Temp, Prefetch, Downloads, Desktop, Recent and the Recycle Bin,
-        processes opening and closing, and windows hidden from screen capture
-        (SetWindowDisplayAffinity WDA_EXCLUDEFROMCAPTURE / WDA_MONITOR).
-        Runs until Ctrl+C.
+    The live monitor is a separate script: LiveMonitor.ps1.
 
     Colour key:
         GREEN  [PASS]  check passed
@@ -37,9 +32,7 @@ param(
     # Do not try to relaunch as administrator (some checks will be limited).
     [switch]$NoElevate,
     # Skip Step 2.
-    [switch]$SkipProcessExplorer,
-    # Skip Step 3.
-    [switch]$SkipLiveMonitor
+    [switch]$SkipProcessExplorer
 )
 
 # =============================================================================
@@ -103,20 +96,6 @@ $Config = @{
     # Sysinternals live download location for Step 2.
     SysinternalsLive = 'https://live.sysinternals.com'
 
-    # Folders watched by the Step 3 live monitor (environment variables are expanded).
-    MonitorFolders = @(
-        @{ Path = '%TEMP%';                         Recurse = $true },
-        @{ Path = '%SystemRoot%\Temp';              Recurse = $true },
-        @{ Path = '%SystemRoot%\Prefetch';          Recurse = $false },
-        @{ Path = '%USERPROFILE%\Downloads';        Recurse = $true },
-        @{ Path = '%USERPROFILE%\Desktop';          Recurse = $true },
-        @{ Path = '%APPDATA%\Microsoft\Windows\Recent'; Recurse = $false },
-        @{ Path = '%SystemDrive%\$Recycle.Bin';     Recurse = $true }
-    )
-
-    # File events with these extensions are shown in YELLOW (all Prefetch and
-    # Recycle Bin events are as well).
-    MonitorFlaggedExtensions = @('.exe', '.dll', '.sys', '.bat', '.cmd', '.ps1', '.vbs', '.lua', '.luau', '.ahk')
 }
 
 # =============================================================================
@@ -894,202 +873,14 @@ function Invoke-Step2ProcessExplorer {
             return
         }
         $proc = Start-Process -FilePath $target -ArgumentList '/accepteula' -PassThru -ErrorAction Stop
-        Write-Result PASS 'Process Explorer' "PID $($proc.Id)"
-        $script:ProcExpDir = $tempDir
+        Write-Result PASS 'Process Explorer'
+        $proc.WaitForExit()
+        Start-Sleep -Milliseconds 500
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     catch {
         Write-Result FAIL 'Process Explorer' "Could not download or start: $($_.Exception.Message)"
         Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-# =============================================================================
-#  Step 3 - Live monitor
-# =============================================================================
-$script:ProcExpDir   = $null
-$script:ProcPaths    = @{}
-$script:HiddenSeen   = @{}
-
-function Write-MonitorLine {
-    param([datetime]$Time, [string]$Kind, $ProcessId, [string]$Path, [string]$Extra = '', [string]$Colour = 'Gray')
-    $idText = if ($null -ne $ProcessId -and "$ProcessId" -ne '') { "$ProcessId" } else { '-' }
-    $line   = '{0:HH:mm:ss.fff}  {1,-14} {2,-7} {3}' -f $Time, $Kind, $idText, $Path
-    if ($Extra) { $line += "  [$Extra]" }
-    Write-Host $line -ForegroundColor $Colour
-}
-
-function Resolve-ProcessPath([int]$ProcessId, [string]$Name) {
-    try {
-        $path = (Get-Process -Id $ProcessId -ErrorAction Stop).Path
-        if ($path) { return $path }
-    }
-    catch { }
-    try {
-        $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
-        if ($cim -and $cim.ExecutablePath) { return $cim.ExecutablePath }
-    }
-    catch { }
-    if ($Name) { $Name } else { 'unknown' }
-}
-
-function Show-ProcessEvent($EventRecord, [bool]$Started) {
-    $data   = $EventRecord.SourceEventArgs.NewEvent
-    $target = if ($data.TargetInstance) { $data.TargetInstance } else { $data }
-    $procId = [int]$target.ProcessId
-    $name   = if ($target.ProcessName) { "$($target.ProcessName)" } else { "$($target.Name)" }
-    $time   = $EventRecord.TimeGenerated
-    if ($data.TIME_CREATED) {
-        try { $time = [DateTime]::FromFileTimeUtc([long]$data.TIME_CREATED).ToLocalTime() } catch { }
-    }
-
-    if ($Started) {
-        $path = if ($target.ExecutablePath) { "$($target.ExecutablePath)" } else { Resolve-ProcessPath $procId $name }
-        $script:ProcPaths[$procId] = $path
-
-        $flags = @()
-        $category = Get-FlaggedCategory ([IO.Path]::GetFileNameWithoutExtension($name))
-        if ($category) { $flags += $category }
-        if ([IO.Path]::IsPathRooted($path) -and (Test-Path -LiteralPath $path)) {
-            $sig = Get-FileSignature $path
-            if (-not $sig -or $sig.Status -ne 'Valid') { $flags += $(if ($sig) { "$($sig.Status)" } else { 'Unreadable' }) }
-        }
-        $colour = if ($flags.Count -gt 0) { 'Yellow' } else { 'Gray' }
-        Write-MonitorLine $time 'PROCESS OPENED' $procId $path ($flags -join ', ') $colour
-    }
-    else {
-        $path = if ($target.ExecutablePath) { "$($target.ExecutablePath)" }
-                elseif ($script:ProcPaths.ContainsKey($procId)) { $script:ProcPaths[$procId] }
-                else { $name }
-        $script:ProcPaths.Remove($procId)
-        $colour = if (Get-FlaggedCategory ([IO.Path]::GetFileNameWithoutExtension($name))) { 'Yellow' } else { 'Gray' }
-        Write-MonitorLine $time 'PROCESS CLOSED' $procId $path '' $colour
-    }
-}
-
-function Show-FileEvent($EventRecord, [string]$WatchRoot) {
-    $args0 = $EventRecord.SourceEventArgs
-    $path  = $args0.FullPath
-    $kind  = switch ("$($args0.ChangeType)") {
-        'Created' { 'FILE CREATED' }
-        'Deleted' { 'FILE DELETED' }
-        'Renamed' { 'FILE RENAMED' }
-        default   { "FILE $("$($args0.ChangeType)".ToUpperInvariant())" }
-    }
-    $shown = if ($args0.ChangeType -eq 'Renamed') { "$($args0.OldFullPath) -> $path" } else { $path }
-
-    $flagged = $WatchRoot -match '\\(Prefetch|\$Recycle\.Bin)$' -or
-               ($Config.MonitorFlaggedExtensions -contains [IO.Path]::GetExtension($path).ToLowerInvariant())
-    if ($args0.ChangeType -eq 'Renamed' -and -not $flagged) {
-        $flagged = $Config.MonitorFlaggedExtensions -contains [IO.Path]::GetExtension($args0.OldFullPath).ToLowerInvariant()
-    }
-    $colour = if ($flagged) { 'Yellow' } else { 'Gray' }
-    # Windows does not report which process changed a file.
-    Write-MonitorLine $EventRecord.TimeGenerated $kind $null $shown '' $colour
-}
-
-function Update-CaptureHidden {
-    $windows = Get-CaptureHiddenWindows
-    if ($null -eq $windows) { return }
-    $now     = Get-Date
-    $current = @{}
-    foreach ($w in $windows) {
-        $key = "$($w.Handle)"
-        $current[$key] = $w
-        $previous = $script:HiddenSeen[$key]
-        if (-not $previous -or $previous.Affinity -ne $w.Affinity) {
-            $path = Resolve-ProcessPath ([int]$w.ProcessId) ''
-            Write-MonitorLine $now 'CAPTURE HIDDEN' $w.ProcessId $path "$(Get-AffinityName $w.Affinity): '$($w.Title)'" Red
-        }
-    }
-    foreach ($key in @($script:HiddenSeen.Keys)) {
-        if (-not $current.ContainsKey($key)) {
-            $old  = $script:HiddenSeen[$key]
-            $path = Resolve-ProcessPath ([int]$old.ProcessId) ''
-            Write-MonitorLine $now 'CAPTURE SHOWN' $old.ProcessId $path "window closed or no longer hidden: '$($old.Title)'" Yellow
-        }
-    }
-    $script:HiddenSeen = $current
-}
-
-function Invoke-Step3LiveMonitor {
-    Write-Host ''
-    Write-Host 'Live monitor - press Ctrl+C to stop' -ForegroundColor Cyan
-    Write-Host ('{0,-12}  {1,-14} {2,-7} {3}' -f 'TIME', 'EVENT', 'PID', 'PATH') -ForegroundColor White
-
-    # Compile the capture scanner first so its temp files are not reported.
-    $null = Get-CaptureHiddenWindows
-
-    Get-EventSubscriber -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like 'AC.*' } | Unregister-Event -ErrorAction SilentlyContinue
-    Get-Event -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like 'AC.*' } | Remove-Event -ErrorAction SilentlyContinue
-
-    foreach ($p in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
-        $script:ProcPaths[[int]$p.ProcessId] = if ($p.ExecutablePath) { $p.ExecutablePath } else { $p.Name }
-    }
-
-    $watchers   = New-Object System.Collections.Generic.List[object]
-    $watchRoots = @{}
-    try {
-        # Process open / close. The trace classes catch short-lived processes but
-        # need administrator rights; otherwise poll Win32_Process every second.
-        try {
-            Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -SourceIdentifier 'AC.ProcStart' -ErrorAction Stop | Out-Null
-            Register-CimIndicationEvent -ClassName Win32_ProcessStopTrace  -SourceIdentifier 'AC.ProcStop'  -ErrorAction Stop | Out-Null
-        }
-        catch {
-            Get-EventSubscriber -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like 'AC.Proc*' } | Unregister-Event -ErrorAction SilentlyContinue
-            Register-CimIndicationEvent -Query "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'" -SourceIdentifier 'AC.ProcStart' | Out-Null
-            Register-CimIndicationEvent -Query "SELECT * FROM __InstanceDeletionEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'" -SourceIdentifier 'AC.ProcStop'  | Out-Null
-        }
-
-        # File created / deleted / renamed.
-        $i = 0
-        $seenPaths = @{}
-        foreach ($folder in $Config.MonitorFolders) {
-            $path = [Environment]::ExpandEnvironmentVariables($folder.Path).TrimEnd('\')
-            if ($seenPaths.ContainsKey($path) -or -not (Test-Path -LiteralPath $path -PathType Container)) { continue }
-            $seenPaths[$path] = $true
-            try {
-                $watcher = New-Object IO.FileSystemWatcher
-                $watcher.Path                  = $path
-                $watcher.IncludeSubdirectories = [bool]$folder.Recurse
-                $watcher.NotifyFilter          = [IO.NotifyFilters]'FileName, DirectoryName'
-                $watcher.InternalBufferSize    = 65536
-                $i++
-                foreach ($eventName in 'Created', 'Deleted', 'Renamed') {
-                    $id = "AC.File.$i.$eventName"
-                    Register-ObjectEvent -InputObject $watcher -EventName $eventName -SourceIdentifier $id | Out-Null
-                    $watchRoots[$id] = $path
-                }
-                $watcher.EnableRaisingEvents = $true
-                $watchers.Add($watcher)
-            }
-            catch { }
-        }
-
-        Update-CaptureHidden
-        $nextScan = (Get-Date).AddSeconds(2)
-
-        while ($true) {
-            $evt = Wait-Event -Timeout 1
-            if ($evt) {
-                Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
-                switch -Wildcard ($evt.SourceIdentifier) {
-                    'AC.ProcStart' { Show-ProcessEvent $evt $true }
-                    'AC.ProcStop'  { Show-ProcessEvent $evt $false }
-                    'AC.File.*'    { Show-FileEvent $evt $watchRoots[$evt.SourceIdentifier] }
-                }
-            }
-            if ((Get-Date) -ge $nextScan) {
-                Update-CaptureHidden
-                $nextScan = (Get-Date).AddSeconds(2)
-            }
-        }
-    }
-    finally {
-        Get-EventSubscriber -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like 'AC.*' } | Unregister-Event -ErrorAction SilentlyContinue
-        Get-Event -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like 'AC.*' } | Remove-Event -ErrorAction SilentlyContinue
-        foreach ($w in $watchers) { $w.EnableRaisingEvents = $false; $w.Dispose() }
-        if ($script:ProcExpDir) { Remove-Item -LiteralPath $script:ProcExpDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -1105,7 +896,6 @@ function Invoke-AntiCheatCheck {
         if ($PSCommandPath) {
             $argList = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
             if ($SkipProcessExplorer) { $argList += '-SkipProcessExplorer' }
-            if ($SkipLiveMonitor)     { $argList += '-SkipLiveMonitor' }
         }
         else {
             # Started from memory via iex: download and run again in the elevated window.
@@ -1129,12 +919,6 @@ function Invoke-AntiCheatCheck {
         Write-Host ''
         Read-Host 'Press Enter to continue to Step 2 (Process Explorer)' | Out-Null
         Invoke-Step2ProcessExplorer
-    }
-
-    if (-not $SkipLiveMonitor) {
-        Write-Host ''
-        Read-Host 'Press Enter to continue to Step 3 (Live Monitor)' | Out-Null
-        Invoke-Step3LiveMonitor
     }
 }
 

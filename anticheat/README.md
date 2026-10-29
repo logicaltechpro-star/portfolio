@@ -20,7 +20,7 @@ Running from a saved file also works:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\AntiCheatCheck.ps1
 ```
 
-Options (file mode only): `-SkipProcessExplorer`, `-SkipLiveMonitor`, `-NoElevate`.
+Options (file mode only): `-SkipProcessExplorer`, `-NoElevate`.
 
 Output is results only: one line per check, the flagged items under it, then the safety score.
 
@@ -46,22 +46,29 @@ The AMSI check runs Microsoft's harmless "AMSI test sample", so Windows Security
 
 ## Step 2 - Process Explorer
 
-After Step 1 the player presses Enter. The script downloads `procexp64.exe` (or the ARM64/x86 build) from `live.sysinternals.com` into a temporary folder, checks it has a valid Microsoft signature and launches it. Nothing is installed. The temporary copy is deleted when the live monitor stops.
+After Step 1 the player presses Enter. The script downloads `procexp64.exe` (or the ARM64/x86 build) from `live.sysinternals.com` into a temporary folder, checks it has a valid Microsoft signature and launches it. Nothing is installed. When Process Explorer is closed, the temporary copy is deleted.
 
-## Step 3 - Live monitor
+## Live monitor (`LiveMonitor.ps1`)
 
-The player presses Enter again. The monitor then prints one line per event, with the time, event, PID and path, until Ctrl+C is pressed:
+The live monitor is a separate script:
 
-| Event | Source | Colour |
-|---|---|---|
-| `FILE CREATED` / `FILE DELETED` / `FILE RENAMED` | Temp, Windows\Temp, Prefetch, Downloads, Desktop, Recent, Recycle Bin | yellow for Prefetch, Recycle Bin and `.exe .dll .sys .bat .cmd .ps1 .vbs .lua .luau .ahk`, otherwise grey |
-| `PROCESS OPENED` / `PROCESS CLOSED` | WMI process start/stop trace (polled every second if not admin) | yellow for flagged names or unsigned executables, otherwise grey |
-| `CAPTURE HIDDEN` / `CAPTURE SHOWN` | Windows with `WDA_EXCLUDEFROMCAPTURE` or `WDA_MONITOR` display affinity, checked every 2 seconds | red / yellow |
+```powershell
+iex (iwr "https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/LiveMonitor.ps1" -UseBasicParsing).Content
+```
 
-Windows file notifications do not say which process made the change, so file events show `-` for PID.
+It relaunches itself as administrator the same way as the main check. It prints one line per event with the time, event, PID and path, until Ctrl+C is pressed:
 
-Step 1 also reports any window that is already hidden from capture.
+| Event | Colour |
+|---|---|
+| `FILE CREATED` / `FILE DELETED` / `FILE RENAMED` in Temp, Windows\Temp, Prefetch, Downloads, Desktop, Recent, Recycle Bin, Roblox logs. The process that made the change is shown next to the path. | yellow for Prefetch, Recycle Bin, Roblox logs and `.exe .dll .sys .bat .cmd .ps1 .vbs .lua .luau .ahk`, otherwise grey |
+| `PROCESS OPENED` (with parent) / `PROCESS CLOSED` | yellow for flagged names or unsigned executables, otherwise grey |
+| `DRIVER LOADED` | red for flagged or unsigned drivers, otherwise yellow |
+| `CAPTURE HIDDEN` / `CAPTURE SHOWN`: windows using `WDA_EXCLUDEFROMCAPTURE` or `WDA_MONITOR`, checked every 2 seconds | red / yellow |
+
+As administrator on 64-bit Windows, the monitor uses the Windows Kernel-File and Kernel-Process event tracing (ETW) providers. This gives the PID for file events and catches processes that only run for a moment. Without that, it falls back to folder watchers and WMI. In that mode file events show `-` for PID and drivers are not reported, and a yellow line at the top says so.
+
+The ETW session is called `AntiCheatLiveMonitor`. Ctrl+C stops it. If the window is closed with the X instead, the session keeps running until the next time the monitor starts (it stops any old session first) or until `logman stop AntiCheatLiveMonitor -ets` is run.
 
 ## Tuning
 
-The flagged process names, window titles, folders, drivers and VM indicators are in the `$Config` block at the top of the script. Scoring weights are the numbers passed to `Write-Result`, and the per-category caps are in `$script:PenaltyCaps`.
+The flagged process names, window titles, folders, drivers and VM indicators are in the `$Config` block at the top of each script. Scoring weights are the numbers passed to `Write-Result`, and the per-category caps are in `$script:PenaltyCaps`.
