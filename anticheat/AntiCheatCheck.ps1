@@ -1,55 +1,29 @@
 <#
-.SYNOPSIS
-    Community Anti-Cheat PC Check.
+    Anti-cheat PC check
 
-.DESCRIPTION
-    Step 1 - System check
-        Hardware (CPU / GPU), operating system, virtual machine detection,
-        Microsoft Defender status, Defender exclusions (cmdlet + registry),
-        PowerShell integrity, boot/kernel
-        integrity and other indicators, followed by a safety score out of 100.
+    Step 1  system check + safety score
+    Step 2  Process Explorer (downloaded to temp, removed after)
+    Step 3  registry check (ShimCache, Amcache, BAM, UserAssist, etc.)
 
-    Step 2 - Process Explorer (Sysinternals)
-        Downloaded to a temporary folder (nothing is installed), its Microsoft
-        signature is verified, it is launched for staff review and the
-        temporary copy is removed once it is closed.
+    Green = pass, yellow = staff should look at it, red = fail.
+    Live monitor is in LiveMonitor.ps1.
 
-    Step 3 - Registry check
-        Execution traces from ShimCache, Amcache, BAM, UserAssist, MUICache,
-        the Compatibility Assistant store, FeatureUsage and RunMRU, checked
-        for keywords and with custom detection rules.
-
-    The live monitor is a separate script: LiveMonitor.ps1.
-
-    Colour key:
-        GREEN  [PASS]  check passed
-        YELLOW [WARN]  flagged for staff review
-        RED    [FAIL]  check failed
-        CYAN   [INFO]  information only
-
-.EXAMPLE
-    irm https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/AntiCheatCheck.ps1 | iex
-.EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\AntiCheatCheck.ps1
+    Run:
+        iex (iwr "https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/AntiCheatCheck.ps1" -UseBasicParsing).Content
 #>
 [CmdletBinding()]
 param(
-    # Do not try to relaunch as administrator (some checks will be limited).
+    # don't relaunch as admin (some checks won't work)
     [switch]$NoElevate,
-    # Skip Step 2.
     [switch]$SkipProcessExplorer,
-    # Skip Step 3.
     [switch]$SkipRegistry
 )
 
-# =============================================================================
-#  Configuration - edit these lists to tune what gets flagged
-# =============================================================================
+#region Configuration
 $Config = @{
     ScriptVersion = '1.0.0'
 
-    # Executable base names (no .exe, case-insensitive). Matches are shown in
-    # YELLOW for staff review, never red.
+    # exe names without .exe - these only ever show yellow
     FlaggedNames = [ordered]@{
         'Executor / injector' = @(
             'synapse', 'synapsex', 'synapse x', 'krnl', 'krnlss', 'fluxus', 'scriptware',
@@ -74,56 +48,52 @@ $Config = @{
         )
     }
 
-    # Folder names directly under %APPDATA% / %LOCALAPPDATA% that are flagged.
+    # folders in AppData / LocalAppData that executors leave behind
     FlaggedFolders = @(
         'Solara', 'krnl', 'Fluxus', 'Celery', 'Xeno', 'Synapse X', 'Seliware', 'Nezur',
         'Zenith', 'Volcano', 'Velocity', 'Script-Ware', 'JJSploit', 'Wave'
     )
 
-    # Kernel driver base names that are flagged.
+    # drivers used by CE, process hacker, kdmapper etc
     FlaggedDrivers = @('dbk64', 'dbk32', 'capcom', 'kprocesshacker', 'kprocesshacker2', 'kprocesshacker3', 'ksysteminformer', 'iqvw64e', 'gdrv')
 
-    # Vendor strings that indicate a virtual machine.
+    # anything matching this in BIOS / model / disk names = VM
     VmVendorPattern = 'VMware|VirtualBox|VBOX|innotek|QEMU|KVM|Xen|Parallels|Bochs|BHYVE|Virtual Machine|Hyper-V|Red Hat|Proxmox|Amazon EC2|Google Compute'
 
-    # Guest-tools services / processes that only run inside a virtual machine.
+    # guest tools - these only run inside a VM, not on the host
     VmServices  = @('VBoxService', 'VBoxGuest', 'VBoxSF', 'VBoxMouse', 'VMTools', 'vm3dservice', 'vmhgfs', 'VGAuthService', 'QEMU-GA', 'QEMU Guest Agent', 'prl_tools', 'xenservice', 'xensvc')
     VmProcesses = @('vmtoolsd', 'vmwaretray', 'vmwareuser', 'vboxservice', 'vboxtray', 'qemu-ga', 'prl_cc', 'prl_tools', 'xenservice', 'vmsrvc', 'vmusrvc')
 
-    # MAC address prefixes registered to hypervisor vendors.
+    # VMware, VirtualBox, Hyper-V, Parallels, Xen, QEMU MAC prefixes
     VmMacPrefixes = @('00:05:69', '00:0C:29', '00:1C:14', '00:50:56', '08:00:27', '0A:00:27', '00:15:5D', '00:1C:42', '00:16:3E', '52:54:00')
 
-    # Where this script is hosted. Used to relaunch as administrator when it
-    # was started with "irm ... | iex" (there is no file to relaunch).
+    # used to re-download the script in the admin window when run through iex
     ScriptUrl = 'https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/AntiCheatCheck.ps1'
 
-    # Executables in these locations are treated as higher risk when unsigned (regex).
+    # places cheats usually get run from
     SuspiciousLocationPattern = '\\AppData\\Local\\Temp\\|\\Windows\\Temp\\|\\Downloads\\|\\Desktop\\|\\Users\\Public\\|\\\$Recycle\.Bin\\|\\ProgramData\\[^\\]+\.exe$'
 
-    # Step 3: words looked for in executable file names from registry traces.
+    # step 3 keywords (matched against the file name)
     RegistryKeywords = @('app', 'loader', 'map')
 
-    # Step 3: paths skipped by keyword and location rules (Windows itself, Store apps).
+    # step 3 ignores C:\Windows (except Temp) and store apps
     RegistryIgnorePattern = '^[A-Za-z]:\\Windows\\(?!Temp\\)|\\Program Files\\WindowsApps\\'
 
-    # Step 3: extensions expected for executed files; anything else is flagged.
+    # anything that ran with an extension not in here gets flagged (renamed exe etc)
     ExecutableExtensions = @('.exe', '.dll', '.com', '.scr', '.sys', '.msi', '.msp', '.msu', '.cpl', '.ocx',
                              '.bat', '.cmd', '.ps1', '.vbs', '.js', '.jar', '.lnk', '.appref-ms')
 
-    # Step 3: SHA1 hashes (lower-case) of known cheat files, matched against Amcache. Shown in RED.
+    # SHA1s of known cheat files, lowercase. matched against amcache, shows red
     KnownBadSha1 = @()
 
-    # Sysinternals live download location for Step 2.
     SysinternalsLive = 'https://live.sysinternals.com'
-
 }
+#endregion
 
-# =============================================================================
-#  Output helpers
-# =============================================================================
+#region Output helpers
 $script:Results         = New-Object System.Collections.Generic.List[object]
 $script:CategoryPenalty = @{}
-# Maximum points a single category can remove from the score.
+# max points one category can take off, so 20 unsigned drivers don't zero the score
 $script:PenaltyCaps     = @{
     Defender        = 40
     Prefetch        = 15
@@ -162,14 +132,12 @@ function Write-Result {
     })
 }
 
-# Indented detail line under a result (e.g. each flagged item).
 function Write-Item([string]$Text, [string]$Colour = 'Gray') {
     Write-Host "       - $Text" -ForegroundColor $Colour
 }
+#endregion
 
-# =============================================================================
-#  General helpers
-# =============================================================================
+#region General helpers
 function Test-IsAdmin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal $identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -201,10 +169,9 @@ function Get-FlaggedCategory([string]$BaseName) {
     }
     $null
 }
+#endregion
 
-# =============================================================================
-#  Step 1 - System check
-# =============================================================================
+#region Step 1 - system check
 function Test-OperatingSystem {
     $isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
     if (-not $isWindows) {
@@ -220,7 +187,7 @@ function Test-OperatingSystem {
         Write-Result PASS 'Operating system is Windows' ([Environment]::OSVersion.VersionString)
     }
 
-    # Windows API layer on Linux/macOS.
+    # wine
     if (Test-Path 'HKLM:\SOFTWARE\Wine') {
         Write-Result FAIL 'Not running under Wine' 'Wine registry key found' 40
     }
@@ -266,7 +233,6 @@ function Test-VirtualMachine {
     }
     catch { $weak.Add('Could not read system/BIOS information') }
 
-    # ACPI table names left by hypervisors.
     try {
         foreach ($table in @(Get-ChildItem 'HKLM:\HARDWARE\ACPI\DSDT' -ErrorAction Stop)) {
             if ($table.PSChildName -match 'VBOX|BOCHS|QEMU|XEN|PRLS|BHYVE|VRTUAL') { $strong.Add("ACPI table = $($table.PSChildName)") }
@@ -301,7 +267,7 @@ function Test-VirtualMachine {
         $adapters = Get-CimInstance -ClassName Win32_NetworkAdapter -Filter 'PhysicalAdapter=True' -ErrorAction Stop
         foreach ($nic in @($adapters)) {
             if (-not $nic.MACAddress) { continue }
-            # Host-side virtual switches (VMware/VirtualBox/Hyper-V on the host) are expected.
+            # skip virtual switches - normal on a host that has VMware/Hyper-V installed
             if ($nic.Name -match 'Virtual|VMware|VirtualBox|Hyper-V|vEthernet|Loopback|TAP|Miniport') { continue }
             $prefix = $nic.MACAddress.Substring(0, 8).ToUpperInvariant()
             if ($Config.VmMacPrefixes -contains $prefix) { $weak.Add("Network adapter '$($nic.Name)' has hypervisor MAC $($nic.MACAddress)") }
@@ -324,7 +290,7 @@ function Test-VirtualMachine {
 
 function Test-Defender {
 
-    # Third-party antivirus registered with Windows Security Center.
+    # if another AV is installed defender goes passive, so don't fail them for that
     try {
         $products = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop
         $script:ThirdPartyAv = @($products | Where-Object {
@@ -385,7 +351,7 @@ function Test-Defender {
         Write-Result PASS 'Security intelligence age' ("{0} day(s) old" -f $mp.AntivirusSignatureAge)
     }
 
-    # Group Policy / registry values commonly used to switch Defender off.
+    # policy keys people use to kill defender
     $policyRoot = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
     $policies = @(
         @{ Path = $policyRoot; Name = 'DisableAntiSpyware' },
@@ -449,7 +415,7 @@ function Test-DefenderExclusions {
                     $found.Add("[Registry $sub] $valueName")
                 }
             }
-            # Defender's own key is normally readable by SYSTEM only; Get-MpPreference covers it.
+            # usually SYSTEM-only, Get-MpPreference already covers it
             catch { }
         }
     }
@@ -484,7 +450,7 @@ function Test-Prefetch {
 
     $hits = 0
     foreach ($file in $files) {
-        # NAME.EXE-HASH.pf
+        # SOLARA.EXE-1A2B3C4D.pf -> SOLARA.EXE
         $exe  = $file.BaseName -replace '-[0-9A-F]{8}$', ''
         $base = [IO.Path]::GetFileNameWithoutExtension($exe)
         $category = Get-FlaggedCategory $base
@@ -547,7 +513,6 @@ function Test-Drivers {
 }
 
 function Test-PowerShellIntegrity {
-    # The host executable must be Microsoft-signed.
     $hostPath = (Get-Process -Id $PID).Path
     $hostSig  = Get-FileSignature $hostPath
     if ($hostSig -and $hostSig.Status -eq 'Valid' -and (Get-SignerName $hostSig) -match 'Microsoft') {
@@ -558,7 +523,6 @@ function Test-PowerShellIntegrity {
         Write-Result FAIL 'PowerShell host is genuine' "$hostPath [$status]" 20
     }
 
-    # The engine assembly must be signed.
     $engine    = [PSObject].Assembly.Location
     $engineSig = Get-FileSignature $engine
     if ($engineSig -and $engineSig.Status -eq 'Valid') {
@@ -569,7 +533,7 @@ function Test-PowerShellIntegrity {
         Write-Result WARN 'PowerShell engine is signed' "$engine [$status]" 5
     }
 
-    # Cmdlets this script relies on must not be shadowed by aliases or functions.
+    # make sure nobody has swapped out the cmdlets we use with their own functions/aliases
     $critical = 'Get-Process', 'Get-CimInstance', 'Get-AuthenticodeSignature', 'Get-ChildItem', 'Get-Item',
                 'Get-ItemProperty', 'Get-Service', 'Get-MpComputerStatus', 'Get-MpPreference', 'Test-Path',
                 'Write-Host', 'Get-FileHash', 'Invoke-WebRequest', 'Start-Process', 'Where-Object', 'ForEach-Object'
@@ -591,7 +555,7 @@ function Test-PowerShellIntegrity {
         Write-Result PASS 'Core commands are not overridden'
     }
 
-    # Profiles run before any script unless -NoProfile is used.
+    # profiles run before us unless -NoProfile, so they could tamper with things
     $profiles = @($PROFILE.AllUsersAllHosts, $PROFILE.AllUsersCurrentHost, $PROFILE.CurrentUserAllHosts, $PROFILE.CurrentUserCurrentHost) |
         Where-Object { $_ -and (Test-Path -LiteralPath $_) -and (Get-Item -LiteralPath $_).Length -gt 0 }
     if (@($profiles).Count -gt 0) {
@@ -602,8 +566,8 @@ function Test-PowerShellIntegrity {
         Write-Result PASS 'No PowerShell profiles'
     }
 
-    # AMSI functional test using Microsoft's harmless AMSI test sample. The
-    # string is assembled at runtime so this file itself is not detected.
+    # AMSI test sample - if AMSI works this gets blocked. built at runtime so
+    # defender doesn't flag this file
     $sample = "'AMSI Test Sample: " + (@('7e72c3ce', '861b', '4339', '8740', '0ac1484f1386') -join '-') + "'"
     $blocked = $false
     try { $null = Invoke-Expression $sample -ErrorAction Stop }
@@ -621,7 +585,7 @@ function Test-PowerShellIntegrity {
 
 function Test-SystemIntegrity {
 
-    # Options of the current boot (locale independent, unlike bcdedit output).
+    # using this instead of bcdedit because bcdedit output changes with language
     $startOptions = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name SystemStartOptions -ErrorAction SilentlyContinue).SystemStartOptions
     $bootChecks = @(
         @{ Name = 'Test signing mode is off';         Pattern = '\bTESTSIGNING\b';              Penalty = 25 },
@@ -696,10 +660,9 @@ function Invoke-Step1SystemCheck {
 
     Show-SafetyScore
 }
+#endregion
 
-# =============================================================================
-#  Step 2 - Process Explorer
-# =============================================================================
+#region Step 2 - Process Explorer
 function Invoke-Step2ProcessExplorer {
     Write-Host ''
 
@@ -720,7 +683,7 @@ function Invoke-Step2ProcessExplorer {
             Invoke-WebRequest -Uri "$($Config.SysinternalsLive)/$exe" -OutFile $target -UseBasicParsing -ErrorAction Stop
         }
         catch {
-            # Fallback: the Sysinternals Live WebDAV share.
+            # try the webdav share instead
             Copy-Item -LiteralPath "\\live.sysinternals.com\tools\$exe" -Destination $target -ErrorAction Stop
         }
         finally {
@@ -744,10 +707,9 @@ function Invoke-Step2ProcessExplorer {
         Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+#endregion
 
-# =============================================================================
-#  Step 3 - Registry check
-# =============================================================================
+#region Step 3 - registry check
 $script:RegistryNativeSource = @'
 using System;
 using System.Runtime.InteropServices;
@@ -794,7 +756,7 @@ namespace AntiCheat
 $script:Artifacts = @{}
 $script:DeviceMap = @{}
 
-# Known folder GUIDs used by UserAssist paths.
+# UserAssist stores some paths as {known folder guid}\file.exe
 $script:KnownFolders = @{
     '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}' = [Environment]::GetFolderPath('System')
     '{D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27}' = [Environment]::GetFolderPath('SystemX86')
@@ -835,7 +797,7 @@ function ConvertTo-DosPath([string]$Path) {
     [Environment]::ExpandEnvironmentVariables($Path)
 }
 
-# Records one execution trace. Entries are merged per path across sources.
+# one entry per path, sources get merged together
 function Add-Artifact([string]$Path, [string]$Source, $Time = $null, [string]$Sha1 = '') {
     $Path = ConvertTo-DosPath $Path
     if (-not $Path -or $Path.Length -lt 3) { return }
@@ -865,10 +827,8 @@ function ConvertFrom-Rot13([string]$Text) {
     -join $chars
 }
 
-# --- Sources -----------------------------------------------------------------
-
-# AppCompatCache (Windows 8.1-11 "10ts" entries). Lists executables seen by the
-# shim engine; the timestamp is the file's modified time, not a run time.
+# shimcache - win10/11 format. the timestamp in here is file modified time, not
+# when it ran, so we don't use it
 function Read-ShimCache {
     $bytes = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache' -Name AppCompatCache -ErrorAction Stop).AppCompatCache
     $offset = [BitConverter]::ToInt32($bytes, 0)
@@ -885,8 +845,7 @@ function Read-ShimCache {
     $count
 }
 
-# Amcache.hve is locked by Windows, so a shadow copy of it is loaded as a
-# temporary hive.
+# amcache.hve is locked, so copy it out with esentutl (uses VSS) and load the copy
 function Read-Amcache {
     $source = Join-Path $env:SystemRoot 'appcompat\Programs\Amcache.hve'
     $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('amcache-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -917,7 +876,7 @@ function Read-Amcache {
             $root.Close()
         }
         else {
-            # Older layout: Root\File\{volume}\{entry} with value 15 = path, 101 = SHA1.
+            # old win10 layout: value 15 = path, 101 = sha1
             $files = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$mount\Root\File")
             if ($files) {
                 foreach ($volume in $files.GetSubKeyNames()) {
@@ -946,7 +905,7 @@ function Read-Amcache {
     $count
 }
 
-# Background Activity Moderator: last run time per executable, per user.
+# BAM - last run time for each exe, per user
 function Read-Bam {
     $count = 0
     foreach ($root in 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings', 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings') {
@@ -964,7 +923,7 @@ function Read-Bam {
     $count
 }
 
-# UserAssist: programs started from Explorer (ROT13 names, run time at offset 60).
+# userassist names are ROT13, last run time is at byte 60
 function Read-UserAssist {
     $count = 0
     foreach ($sid in Get-UserHives) {
@@ -989,7 +948,7 @@ function Read-UserAssist {
     $count
 }
 
-# Value names that are executable paths (no timestamps).
+# for keys where the value names are just exe paths (muicache etc)
 function Read-PathValueNames([string]$Source, [string]$SubPath, [string]$HiveSuffix = '', [string]$StripPattern = '') {
     $count = 0
     foreach ($sid in Get-UserHives) {
@@ -1005,7 +964,7 @@ function Read-PathValueNames([string]$Source, [string]$SubPath, [string]$HiveSuf
     $count
 }
 
-# Commands typed into Win+R.
+# win+r history
 function Read-RunMru {
     $count = 0
     foreach ($sid in Get-UserHives) {
@@ -1020,8 +979,6 @@ function Read-RunMru {
     $count
 }
 
-# --- Detection ---------------------------------------------------------------
-
 function Get-ArtifactReasons($Artifact) {
     $path     = $Artifact.Path
     $leaf     = ($path -split '\\')[-1]
@@ -1032,18 +989,16 @@ function Get-ArtifactReasons($Artifact) {
     $reasons  = New-Object System.Collections.Generic.List[string]
     $critical = $false
 
-    # 1. Keywords in the file name.
+    # keywords
     if (-not $ignored) {
         foreach ($word in $Config.RegistryKeywords) {
             if ($base.Contains($word.ToLowerInvariant())) { $reasons.Add("keyword '$word'") }
         }
     }
 
-    # 2. Known cheat / tool names.
     $category = Get-FlaggedCategory $base
     if ($category -and $category -ne 'Remote access') { $reasons.Add($category) }
 
-    # 3. Known bad file hashes (Amcache SHA1).
     if ($Artifact.Sha1 -and $Config.KnownBadSha1 -contains $Artifact.Sha1) { $reasons.Add('known bad hash'); $critical = $true }
 
     if ($isPath -and -not $ignored) {
@@ -1051,22 +1006,21 @@ function Get-ArtifactReasons($Artifact) {
         $drive = $null
         if ($path -match '^([A-Za-z]:\\)') { try { $drive = New-Object IO.DriveInfo $Matches[1] } catch { } }
 
-        # 4. Run from removable media or a network share.
+        # usb / network share
         if ($path.StartsWith('\\') -or ($drive -and "$($drive.DriveType)" -in 'Removable', 'Network')) {
             $reasons.Add('removable/network drive')
             $suspiciousPlace = $true
         }
 
-        # 5. Executed file with a non-executable extension (renamed binary).
+        # something ran as .png / .tmp etc - renamed exe
         if ($ext -and $Config.ExecutableExtensions -notcontains $ext -and $Artifact.Sources -notcontains 'RunMRU') {
             $reasons.Add("unusual extension '$ext'")
         }
 
         if ($suspiciousPlace) {
-            # 6. Random-looking file names (hex / GUID).
+            # random hex / guid names
             if ($base -match '^[0-9a-f]{8,}$|^\{?[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\}?$') { $reasons.Add('random name') }
 
-            # 7. Deleted after running, or unsigned.
             if (-not (Test-Path -LiteralPath $path)) {
                 $reasons.Add('deleted')
             }
@@ -1121,12 +1075,10 @@ function Invoke-Step3Registry {
         Write-Result PASS "Registry check ($($script:Artifacts.Count) entries, none flagged)"
     }
 }
+#endregion
 
-# =============================================================================
-#  Main
-# =============================================================================
-# Wrapped in a function so "return" ends the check without closing the
-# player's PowerShell window when the script is run with "irm ... | iex".
+#region Main
+# in a function so 'return' doesn't close the player's window when run via iex
 function Invoke-AntiCheatCheck {
     $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 
@@ -1137,7 +1089,7 @@ function Invoke-AntiCheatCheck {
             if ($SkipRegistry)        { $argList += '-SkipRegistry' }
         }
         else {
-            # Started from memory via iex: download and run again in the elevated window.
+            # no file (ran via iex) so download it again in the admin window
             $command = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; iex (iwr '$($Config.ScriptUrl)' -UseBasicParsing).Content"
             $argList = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "`"$command`"")
         }
@@ -1166,5 +1118,6 @@ function Invoke-AntiCheatCheck {
         Invoke-Step3Registry
     }
 }
+#endregion
 
 Invoke-AntiCheatCheck

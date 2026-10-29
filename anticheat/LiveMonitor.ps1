@@ -1,51 +1,29 @@
 <#
-.SYNOPSIS
-    Community Anti-Cheat Live Monitor.
+    Anti-cheat live monitor
 
-.DESCRIPTION
-    Prints one line per event, with time, PID and path:
+    Shows file created/deleted/renamed (temp, prefetch, downloads, desktop,
+    recent, recycle bin, roblox logs), processes opening/closing, drivers
+    loading and windows hidden from screen capture - with time, PID and path.
 
-        FILE CREATED / FILE DELETED / FILE RENAMED
-            Temp, Windows\Temp, Prefetch, Downloads, Desktop, Recent,
-            Recycle Bin and Roblox logs.
-        PROCESS OPENED / PROCESS CLOSED
-            Every process, with its parent.
-        DRIVER LOADED
-            Kernel drivers loaded while the monitor runs.
-        CAPTURE HIDDEN / CAPTURE SHOWN
-            Windows hidden from screen capture with SetWindowDisplayAffinity
-            (WDA_EXCLUDEFROMCAPTURE / WDA_MONITOR).
+    Needs admin + 64-bit for PIDs on file events (uses ETW). Without that it
+    falls back to FileSystemWatcher + WMI and file events have no PID.
 
-    As administrator on 64-bit Windows the monitor reads the Windows
-    Kernel-File and Kernel-Process event tracing (ETW) providers, which report
-    the PID behind every file event and catch short-lived processes. Otherwise
-    it falls back to folder watchers and WMI, and file events show no PID.
+    Grey = normal, yellow = have a look, red = hidden window / dodgy driver.
 
-    Colour key:
-        GREY    normal activity
-        YELLOW  flagged for staff review
-        RED     hidden window, or flagged / unsigned driver
-
-.EXAMPLE
-    iex (iwr "https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/LiveMonitor.ps1" -UseBasicParsing).Content
-.EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\LiveMonitor.ps1
+    Run:
+        iex (iwr "https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/LiveMonitor.ps1" -UseBasicParsing).Content
 #>
 [CmdletBinding()]
 param(
-    # Do not try to relaunch as administrator (file events will have no PID).
+    # don't relaunch as admin (file events won't have a PID)
     [switch]$NoElevate
 )
 
-# =============================================================================
-#  Configuration
-# =============================================================================
+#region Configuration
 $Config = @{
-    # Where this script is hosted. Used to relaunch as administrator when it
-    # was started with iex (there is no file to relaunch).
+    # used to re-download the script in the admin window when run through iex
     ScriptUrl = 'https://raw.githubusercontent.com/logicaltechpro-star/portfolio/claude/roblox-anticheat-ps1-l8naw6/anticheat/LiveMonitor.ps1'
 
-    # Watched folders (environment variables are expanded).
     Folders = @(
         @{ Path = '%TEMP%';                              Recurse = $true },
         @{ Path = '%SystemRoot%\Temp';                   Recurse = $true },
@@ -58,13 +36,13 @@ $Config = @{
         @{ Path = '%LOCALAPPDATA%\Roblox\logs';          Recurse = $true }
     )
 
-    # File events in these folders are always YELLOW (regex on the path).
+    # anything in these folders is yellow
     FlaggedFolderPattern = '\\Windows\\Prefetch\\|\\\$Recycle\.Bin\\|\\Roblox\\logs\\'
 
-    # File events with these extensions are YELLOW.
+    # and anything with these extensions
     FlaggedExtensions = @('.exe', '.dll', '.sys', '.bat', '.cmd', '.ps1', '.vbs', '.lua', '.luau', '.ahk')
 
-    # Process names (no .exe) shown in YELLOW.
+    # same list as AntiCheatCheck.ps1 - keep them in sync
     FlaggedNames = @(
         'synapse', 'synapsex', 'synapse x', 'krnl', 'krnlss', 'fluxus', 'scriptware', 'script-ware',
         'electron', 'oxygenu', 'oxygen u', 'jjsploit', 'comet', 'trigon', 'evon', 'valyse', 'solara',
@@ -79,16 +57,14 @@ $Config = @{
         'autoclicker', 'opautoclicker', 'gs auto clicker', 'tinytask', 'macrorecorder'
     )
 
-    # Driver names (no .sys) shown in RED.
     FlaggedDrivers = @('dbk64', 'dbk32', 'capcom', 'kprocesshacker', 'kprocesshacker2', 'kprocesshacker3', 'ksysteminformer', 'iqvw64e', 'gdrv')
 
-    # How often windows are checked for capture exclusion, in seconds.
+    # seconds between checks for hidden windows
     CaptureScanSeconds = 2
 }
+#endregion
 
-# =============================================================================
-#  Native helpers
-# =============================================================================
+#region Native helpers
 $script:NativeSource = @'
 using System;
 using System.Collections.Concurrent;
@@ -107,7 +83,7 @@ namespace AntiCheatMonitor
         public string Title;
     }
 
-    // Top-level windows whose display affinity hides them from screen capture.
+    // finds windows using SetWindowDisplayAffinity to hide from OBS etc
     public static class DisplayAffinity
     {
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -158,8 +134,8 @@ namespace AntiCheatMonitor
         public string Path;
     }
 
-    // Real-time ETW session over Microsoft-Windows-Kernel-File and
-    // Microsoft-Windows-Kernel-Process. 64-bit only (structure offsets).
+    // real-time ETW session for Kernel-File + Kernel-Process.
+    // offsets below are for x64 only
     public static class EtwMonitor
     {
         public const string SessionName = "AntiCheatLiveMonitor";
@@ -311,7 +287,7 @@ namespace AntiCheatMonitor
             if (loggerName != IntPtr.Zero) { Marshal.FreeHGlobal(loggerName); loggerName = IntPtr.Zero; }
         }
 
-        // Stops the named session, including one left behind by an earlier run.
+        // also kills a session left over from last time (e.g. window closed with X)
         private static void StopSession()
         {
             IntPtr properties = NewProperties();
@@ -319,7 +295,7 @@ namespace AntiCheatMonitor
             finally { Marshal.FreeHGlobal(properties); }
         }
 
-        // EVENT_TRACE_PROPERTIES (x64) followed by room for the session name.
+        // EVENT_TRACE_PROPERTIES + space for the name after it
         private static IntPtr NewProperties()
         {
             IntPtr p = Marshal.AllocHGlobal(PropertiesBufferSize);
@@ -450,7 +426,7 @@ namespace AntiCheatMonitor
                     }
                     else if (id == 5 && headerPid <= 4)
                     {
-                        // Image loads in the System process are kernel drivers.
+                        // image loads in the System process = drivers
                         string image = ToDosPath(GetString(record, "ImageName"));
                         if (image != null && image.EndsWith(".sys", StringComparison.OrdinalIgnoreCase))
                         {
@@ -464,10 +440,9 @@ namespace AntiCheatMonitor
     }
 }
 '@
+#endregion
 
-# =============================================================================
-#  Helpers
-# =============================================================================
+#region Helpers
 $script:ProcPaths  = @{}
 $script:HiddenSeen = @{}
 $script:SigCache   = @{}
@@ -479,7 +454,7 @@ function Test-IsAdmin {
 
 function Get-SignatureStatus([string]$Path) {
     if (-not $Path -or -not [IO.Path]::IsPathRooted($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
-    # Store apps are package-signed, which Get-AuthenticodeSignature reports as NotSigned.
+    # store apps always show NotSigned even though they're fine
     if ($Path -match '\\Program Files\\WindowsApps\\') { return $null }
     $key = $Path.ToLowerInvariant()
     if (-not $script:SigCache.ContainsKey($key)) {
@@ -609,11 +584,9 @@ function Get-WatchedFolders {
         [pscustomobject]@{ Path = $path; Recurse = [bool]$folder.Recurse }
     }
 }
+#endregion
 
-# =============================================================================
-#  Monitor modes
-# =============================================================================
-# ETW: PIDs for file events, short-lived processes and driver loads.
+#region Monitor modes
 function Start-EtwMonitor($Folders) {
     $paths   = [string[]]@($Folders | ForEach-Object { $_.Path })
     $recurse = [bool[]]@($Folders | ForEach-Object { $_.Recurse })
@@ -654,7 +627,7 @@ function Start-EtwMonitor($Folders) {
     $true
 }
 
-# Fallback: folder watchers (no PID for file events) and WMI process events.
+# used when ETW isn't available
 function Start-FallbackMonitor($Folders) {
     $watchers = New-Object System.Collections.Generic.List[object]
     $cleanup = {
@@ -663,7 +636,7 @@ function Start-FallbackMonitor($Folders) {
     }
     & $cleanup
     try {
-        # Trace classes catch short-lived processes but need administrator rights.
+        # trace classes need admin, otherwise poll every second
         try {
             Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -SourceIdentifier 'ACM.ProcStart' -ErrorAction Stop | Out-Null
             Register-CimIndicationEvent -ClassName Win32_ProcessStopTrace  -SourceIdentifier 'ACM.ProcStop'  -ErrorAction Stop | Out-Null
@@ -729,10 +702,9 @@ function Start-FallbackMonitor($Folders) {
         foreach ($w in $watchers) { $w.EnableRaisingEvents = $false; $w.Dispose() }
     }
 }
+#endregion
 
-# =============================================================================
-#  Main
-# =============================================================================
+#region Main
 function Invoke-LiveMonitor {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         Write-Host '[FAIL] Operating system is Windows' -ForegroundColor Red
@@ -757,7 +729,7 @@ function Invoke-LiveMonitor {
     try { $Host.UI.RawUI.WindowTitle = 'Anti-Cheat Live Monitor' } catch { }
     Clear-Host
 
-    # Compiled before monitoring starts so the compiler's temp files are not reported.
+    # compile before we start watching or csc's temp files show up
     if (-not ('AntiCheatMonitor.EtwMonitor' -as [type])) {
         try { Add-Type -TypeDefinition $script:NativeSource -ErrorAction Stop }
         catch {
@@ -783,5 +755,6 @@ function Invoke-LiveMonitor {
     if ($useEtw -and (Start-EtwMonitor $folders)) { return }
     Start-FallbackMonitor $folders
 }
+#endregion
 
 Invoke-LiveMonitor
