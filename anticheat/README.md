@@ -33,7 +33,7 @@ Output is results only: one line per check, the flagged items under it, then the
 | Virtual machine (BIOS/model/board, ACPI tables, display + disk models, guest tools, hypervisor MACs) | fail on strong indicators, yellow on weak ones |
 | Defender: service, AV, antispyware, real-time, on-access, behaviour, IOAV, network inspection, tamper protection, cloud, signature age, disabling policies | fail (yellow when a third-party AV has replaced Defender) |
 | Defender exclusions (Get-MpPreference + both registry locations) and ASR exclusions | fail / yellow |
-| Running processes: known executor/tool/macro/remote-access names, window titles, windows hidden from screen capture, unsigned or untrusted executables (more weight if in Temp/Downloads/Desktop) | yellow |
+| Running programs are not checked here. Staff review them in Process Explorer (Step 2). | - |
 | Prefetch history and AppData folders for known cheat names | yellow |
 | Running kernel drivers: unsigned or known cheat/mapper drivers | yellow |
 | PowerShell integrity: genuine signed host, signed engine, core cmdlets not overridden, profiles, AMSI working | fail / yellow |

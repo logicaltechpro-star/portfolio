@@ -479,6 +479,8 @@ function Test-IsAdmin {
 
 function Get-SignatureStatus([string]$Path) {
     if (-not $Path -or -not [IO.Path]::IsPathRooted($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    # Store apps are package-signed, which Get-AuthenticodeSignature reports as NotSigned.
+    if ($Path -match '\\Program Files\\WindowsApps\\') { return $null }
     $key = $Path.ToLowerInvariant()
     if (-not $script:SigCache.ContainsKey($key)) {
         $status = 'Unreadable'

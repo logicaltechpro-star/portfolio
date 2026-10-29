@@ -6,7 +6,7 @@
     Step 1 - System check
         Hardware (CPU / GPU), operating system, virtual machine detection,
         Microsoft Defender status, Defender exclusions (cmdlet + registry),
-        running process signatures, PowerShell integrity, boot/kernel
+        PowerShell integrity, boot/kernel
         integrity and other indicators, followed by a safety score out of 100.
 
     Step 2 - Process Explorer (Sysinternals)
@@ -74,9 +74,6 @@ $Config = @{
         )
     }
 
-    # Window titles that are flagged (regex, case-insensitive).
-    FlaggedWindowTitles = 'Synapse X|Script-?Ware|Cheat Engine|Fluxus|\bKRNL\b|Solara|JJSploit|Process Hacker|System Informer|x64dbg|Extreme Injector|Xeno Executor|Celery|Seliware'
-
     # Folder names directly under %APPDATA% / %LOCALAPPDATA% that are flagged.
     FlaggedFolders = @(
         'Solara', 'krnl', 'Fluxus', 'Celery', 'Xeno', 'Synapse X', 'Seliware', 'Nezur',
@@ -119,8 +116,6 @@ $script:CategoryPenalty = @{}
 # Maximum points a single category can remove from the score.
 $script:PenaltyCaps     = @{
     Defender        = 40
-    FlaggedSoftware = 40
-    Processes       = 15
     Prefetch        = 15
     Folders         = 10
     Drivers         = 20
@@ -195,91 +190,6 @@ function Get-FlaggedCategory([string]$BaseName) {
         if ($Config.FlaggedNames[$category] -contains $name) { return $category }
     }
     $null
-}
-
-function Get-FlaggedPenalty([string]$Category) {
-    switch ($Category) {
-        'Executor / injector'    { 15 }
-        'Cheat / reversing tool' { 15 }
-        'Macro / auto-clicker'   { 5 }
-        default                  { 0 }
-    }
-}
-
-# Enumerates top-level windows whose display affinity hides them from screen
-# capture (WDA_MONITOR = 0x1, WDA_EXCLUDEFROMCAPTURE = 0x11).
-$script:WdaSource = @'
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using System.Text;
-
-namespace AntiCheat
-{
-    public class CaptureHiddenWindow
-    {
-        public long Handle;
-        public uint ProcessId;
-        public uint Affinity;
-        public string Title;
-    }
-
-    public static class DisplayAffinity
-    {
-        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        private static extern bool GetWindowDisplayAffinity(IntPtr hWnd, out uint affinity);
-
-        [DllImport("user32.dll")]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
-
-        public static List<CaptureHiddenWindow> Scan()
-        {
-            List<CaptureHiddenWindow> found = new List<CaptureHiddenWindow>();
-            EnumWindows(delegate (IntPtr hWnd, IntPtr lParam)
-            {
-                uint affinity;
-                if (GetWindowDisplayAffinity(hWnd, out affinity) && affinity != 0)
-                {
-                    uint processId;
-                    GetWindowThreadProcessId(hWnd, out processId);
-                    StringBuilder title = new StringBuilder(256);
-                    GetWindowText(hWnd, title, title.Capacity);
-                    CaptureHiddenWindow window = new CaptureHiddenWindow();
-                    window.Handle = hWnd.ToInt64();
-                    window.ProcessId = processId;
-                    window.Affinity = affinity;
-                    window.Title = title.ToString();
-                    found.Add(window);
-                }
-                return true;
-            }, IntPtr.Zero);
-            return found;
-        }
-    }
-}
-'@
-
-function Get-CaptureHiddenWindows {
-    if (-not ('AntiCheat.DisplayAffinity' -as [type])) {
-        try { Add-Type -TypeDefinition $script:WdaSource -ErrorAction Stop } catch { return $null }
-    }
-    , @([AntiCheat.DisplayAffinity]::Scan())
-}
-
-function Get-AffinityName([uint32]$Affinity) {
-    switch ($Affinity) {
-        0x11    { 'ExcludeFromCapture' }
-        0x1     { 'Monitor' }
-        default { '0x{0:X}' -f $Affinity }
-    }
 }
 
 # =============================================================================
@@ -548,77 +458,6 @@ function Test-DefenderExclusions {
     }
 }
 
-function Test-Processes {
-    $procs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)
-
-    $byPath  = @{}
-    $flagged = New-Object System.Collections.Generic.List[object]
-    foreach ($p in $procs) {
-        $base = [IO.Path]::GetFileNameWithoutExtension("$($p.Name)")
-        $category = Get-FlaggedCategory $base
-        if ($category) { $flagged.Add([pscustomobject]@{ Name = $p.Name; Id = $p.ProcessId; Path = $p.ExecutablePath; Category = $category }) }
-        if ($p.ExecutablePath) {
-            if (-not $byPath.ContainsKey($p.ExecutablePath)) { $byPath[$p.ExecutablePath] = New-Object System.Collections.Generic.List[string] }
-            $byPath[$p.ExecutablePath].Add("$($p.ProcessId)")
-        }
-    }
-
-    # Known cheat / tool names.
-    if ($flagged.Count -gt 0) {
-        foreach ($f in $flagged) {
-            $where = if ($f.Path) { $f.Path } else { 'path unavailable' }
-            Write-Result WARN "Flagged process: $($f.Name)" "$($f.Category), PID $($f.Id), $where" (Get-FlaggedPenalty $f.Category) FlaggedSoftware
-        }
-    }
-    else {
-        Write-Result PASS 'No known cheat / tool processes running'
-    }
-
-    # Window titles.
-    $titled = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -and $_.MainWindowTitle -match $Config.FlaggedWindowTitles })
-    foreach ($t in $titled) {
-        Write-Result WARN "Flagged window: '$($t.MainWindowTitle)'" "$($t.ProcessName), PID $($t.Id)" 10 FlaggedSoftware
-    }
-
-    # Windows hidden from screen capture.
-    $hidden = Get-CaptureHiddenWindows
-    if ($null -eq $hidden) {
-        Write-Result WARN 'No windows hidden from screen capture' 'Could not be checked' 3 FlaggedSoftware
-    }
-    elseif ($hidden.Count -gt 0) {
-        foreach ($w in $hidden) {
-            $owner = Get-Process -Id $w.ProcessId -ErrorAction SilentlyContinue
-            $where = if ($owner -and $owner.Path) { $owner.Path } elseif ($owner) { $owner.ProcessName } else { 'unknown' }
-            Write-Result WARN "Window hidden from capture: '$($w.Title)'" "$(Get-AffinityName $w.Affinity), PID $($w.ProcessId), $where" 15 FlaggedSoftware
-        }
-    }
-    else {
-        Write-Result PASS 'No windows hidden from screen capture'
-    }
-
-    # Signatures.
-    $suspiciousLocation = $Config.SuspiciousLocationPattern
-    $unsigned = New-Object System.Collections.Generic.List[object]
-    foreach ($path in $byPath.Keys) {
-        $sig = Get-FileSignature $path
-        $status = if ($sig) { "$($sig.Status)" } else { 'Unreadable' }
-        if ($status -ne 'Valid') {
-            $unsigned.Add([pscustomobject]@{ Path = $path; Status = $status; Pids = ($byPath[$path] -join ','); Suspicious = ($path -match $suspiciousLocation) })
-        }
-    }
-
-    if ($unsigned.Count -gt 0) {
-        foreach ($u in ($unsigned | Sort-Object -Property @{ Expression = 'Suspicious'; Descending = $true }, Path)) {
-            $label   = if ($u.Suspicious) { 'Unsigned in unusual location' } else { 'Unsigned / untrusted process' }
-            $penalty = if ($u.Suspicious) { 4 } else { 1 }
-            Write-Result WARN $label "$($u.Path) [$($u.Status)] PID $($u.Pids)" $penalty Processes
-        }
-    }
-    else {
-        Write-Result PASS 'All running processes are signed'
-    }
-}
-
 function Test-Prefetch {
     $prefetch = Join-Path $env:SystemRoot 'Prefetch'
     try {
@@ -839,7 +678,6 @@ function Invoke-Step1SystemCheck {
     Test-VirtualMachine
     Test-Defender
     Test-DefenderExclusions
-    Test-Processes
     Test-Prefetch
     Test-Folders
     Test-Drivers
